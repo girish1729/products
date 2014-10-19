@@ -1,0 +1,126 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use DBI;
+use DateTime;
+use POSIX qw(strftime);
+use File::Basename qw(dirname);
+use Log::Log4perl qw(get_logger);
+
+use Cwd  qw(abs_path getcwd);
+use lib dirname(dirname(dirname abs_path $0)) . '/mails/configs';
+
+require "imapclient.conf";
+
+my $logfile = $GHIMAPConfig::smuuthconfig{logfile};
+my $logsize = $GHIMAPConfig::smuuthconfig{logsize};
+my $lognumf = $GHIMAPConfig::smuuthconfig{lognumf};
+
+my $instance_root = dirname(dirname(dirname abs_path $0));
+
+sub getlogfilename() {
+	my $dt = DateTime->now; # same as ( epoch => time() )
+	my $y = $dt->year;
+	my $m = $dt->month;
+	$m = sprintf "%02d", $m;
+
+	my $logf = "$instance_root/log/$logfile-$y-$m.txt";
+	return $logf;
+}
+
+# Configuration in a string ...
+my $conf = q(
+		log4perl.category.Mail.fetchoneuser = DEBUG, Logfile
+
+		log4perl.appender.Logfile = Log::Log4perl::Appender::File
+		log4perl.appender.Logfile.filename = sub { return getlogfilename(); }
+		log4perl.appender.Logfile.layout   = Log::Log4perl::Layout::PatternLayout
+		log4perl.PatternLayout.cspec.Z = sub { return strftime("%Z", localtime)}
+		log4perl.appender.Logfile.layout.ConversionPattern = %d %Z %c(%P) %p %m%n
+
+	    );
+
+# ... passed as a reference to init()
+Log::Log4perl::init( \$conf );
+my $log = Log::Log4perl::get_logger("Mail::fetchoneuser");
+
+my $dbname = $GHIMAPConfig::smuuthconfig{dbname};
+my $dbserver = $GHIMAPConfig::smuuthconfig{dbserver};
+my $dbserverport = $GHIMAPConfig::smuuthconfig{dbserverport};
+my $dbuser = $GHIMAPConfig::smuuthconfig{dbuser};
+my $dbpass = $GHIMAPConfig::smuuthconfig{dbpass};
+my $imapserver =$GHIMAPConfig::smuuthconfig{imapserver}; 
+my $dbtype =$GHIMAPConfig::smuuthconfig{dbtype}; 
+my $dbsalt =$GHIMAPConfig::smuuthconfig{virphydb_dbsalt}; 
+my $activedomainsref = $GHIMAPConfig::smuuthconfig{activedomains}; 
+
+my @activedomains = @{$activedomainsref};
+
+my $db = DBI->connect("dbi:$dbtype:dbname=$dbname;" .
+		"host=$dbserver;port=$dbserverport", 
+		"$dbuser", "$dbpass", { AutoCommit => 0} ); 
+
+if(!defined($db)) {
+	$log->error("Could not connect to Postgres db");
+	die "Could not connect to Postgres db";
+}
+
+my $stmt = "";
+
+sub dbfinish {
+	# End transaction and commit changes to DB
+	$stmt->finish;
+	$db->commit or $log->error("Could not commit changed to DB"),die "Could not commit change to DB\n";
+	$db->disconnect or $log->error("Could not disconnect from DB"),die"Could not disconnect from DB\n";
+	$db = undef;
+	$log->debug("DB Finish completed");
+}
+
+
+# From command line
+my $email = "";
+$email = shift;
+
+exit 128 unless(defined($email));
+
+my $dbq = '';
+if($dbtype =~ /Pg/) {
+	$dbq = "select
+VPEM_STATUS,VPEM_EMAIL,convert_from(decrypt(VPEM_PASSWORD, '$dbsalt'," .
+"'aes'),'sql_ascii') from VIRPHY_EMAIL_IDS where VPEM_EMAIL = '$email';";
+	$stmt = $db->prepare($dbq);
+} else {
+	$dbq = "SELECT VPEM_STATUS,VPEM_EMAIL,AES_DECRYPT(VPEM_PASSWORD,
+UNHEX('$dbsalt'))" .  "FROM VIRPHY_EMAIL_IDS where VPEM_EMAIL = '$email';"; 
+	$stmt = $db->prepare($dbq);
+}
+
+$log->debug("About to execute [$dbq]");
+$stmt->execute() or 
+	&dbfinish,
+	$log->error("Could not execute SQL statement"),
+	die "Could not execute SQL statement\n";
+	# This exits with error code 128
+
+
+my @row = ();
+@row = $stmt->fetchrow_array or 
+	&dbfinish,$log->error("Could not fetch SQL entries"),die "Could not fetch SQL entries";
+$stmt->finish;
+my ($status, $mail, $pass) = @row;
+if ($status ne 1) {
+	&dbfinish,$log->error("VPEM_STATUS not 1, so exiting"),exit 128;
+}
+my ($d, $dom) = split /@/, $mail;
+$log->error("This domain is not active, so exiting"),exit 128 unless(grep(/^$dom$/, @activedomains));
+$log->info("Fetching mails of $mail");
+
+system(
+ "$instance_root/exec/mail_client/attachextractmail $imapserver $mail $pass") == 0 or 
+&dbfinish,$log->error("Could not fetch mails/attaches for $mail"),die "Could not fetch mails/attaches for $mail"; 
+	# This exits with error code 128
+
+$log->info("DONE fetching all mails for $mail");
+
+&dbfinish;

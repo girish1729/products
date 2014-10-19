@@ -1,0 +1,122 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use DBI;
+use DateTime;
+use POSIX qw(strftime);
+use File::Basename qw(dirname);
+use Log::Log4perl qw(get_logger);
+
+use Cwd  qw(abs_path getcwd);
+use lib dirname(dirname(dirname abs_path $0)) . '/mails/configs';
+
+require "imapclient.conf";
+
+my $logfile = $SmuuthIMAPConfig::smuuthconfig{logfile};
+my $logsize = $SmuuthIMAPConfig::smuuthconfig{logsize};
+my $lognumf = $SmuuthIMAPConfig::smuuthconfig{lognumf};
+
+my $instance_root = dirname(dirname(dirname abs_path $0));
+
+sub getlogfilename() {
+	my $dt = DateTime->now; # same as ( epoch => time() )
+
+         my $y = $dt->year;
+         my $m = $dt->month;
+	$m = sprintf "%02d", $m;
+
+	my $logf = "$instance_root/log/$logfile-$y-$m.txt";
+	return $logf;
+}
+
+# Configuration in a string ...
+         my $conf = q(
+           log4perl.category.Mail.Client = DEBUG, Logfile
+
+           log4perl.appender.Logfile = Log::Log4perl::Appender::File
+           log4perl.appender.Logfile.filename = sub { return getlogfilename(); }
+           log4perl.appender.Logfile.layout   = Log::Log4perl::Layout::PatternLayout
+	   log4perl.PatternLayout.cspec.Z = sub { return strftime("%Z", localtime)}
+	   log4perl.appender.Logfile.layout.ConversionPattern = %d %Z %c(%P) %p %m%n
+
+         );
+
+            # ... passed as a reference to init()
+         Log::Log4perl::init( \$conf );
+my $log = Log::Log4perl::get_logger("Mail::Client");
+
+
+my $lockfile = "$instance_root/tmp/.fetchattachusers";
+
+if(defined($ARGV[0]) and ($ARGV[0] =~ /rmlockfile/)) {
+	$log->info("Forcibly removing lockfile");	
+	unlink($lockfile);
+	exit;
+	
+}
+
+if(-e $lockfile) {
+	$log->error("Lock file found, so exiting\n");
+	die "Lock file found, so exiting\n";
+}
+
+system("touch $lockfile");
+
+my $dbname = $SmuuthIMAPConfig::smuuthconfig{dbname};
+my $dbserver = $SmuuthIMAPConfig::smuuthconfig{dbserver};
+my $dbserverport = $SmuuthIMAPConfig::smuuthconfig{dbserverport};
+my $dbuser = $SmuuthIMAPConfig::smuuthconfig{dbuser};
+my $dbpass = $SmuuthIMAPConfig::smuuthconfig{dbpass};
+my $imapserver =$SmuuthIMAPConfig::smuuthconfig{imapserver}; 
+my $dbtype =$SmuuthIMAPConfig::smuuthconfig{dbtype}; 
+my $dbsalt =$SmuuthIMAPConfig::smuuthconfig{virphydb_dbsalt}; 
+my $activedomainsref = $SmuuthIMAPConfig::smuuthconfig{activedomains}; 
+
+my @activedomains = @{$activedomainsref};
+
+my $db = DBI->connect("dbi:$dbtype:dbname=$dbname;" .
+		"host=$dbserver;port=$dbserverport", 
+	   "$dbuser", "$dbpass", {AutoCommit => 0}); 
+
+if(!defined($db)) {
+	$log->error("Could not connect to Postgres db");
+	die "Could not connect to Postgres db";
+}
+
+
+
+my $stmt = "";
+
+if($dbtype =~ /Pg/) {
+	$stmt = $db->prepare(
+	"select VPEM_STATUS,VPEM_EMAIL,convert_from(decrypt(VPEM_PASSWORD, '$dbsalt'," 
+	. "'aes'),'sql_ascii') from VIRPHY_EMAIL_IDS;");
+} else {
+	$stmt = $db->prepare(
+	"SELECT VPEM_STATUS,VPEM_EMAIL,AES_DECRYPT(VPEM_PASSWORD, UNHEX('$dbsalt'))" . 
+	"FROM VIRPHY_EMAIL_IDS;"); 
+}
+
+$log->info("Fetching all mails from mail server $imapserver");
+
+$stmt->execute() or die "Could not execute SQL statement\n";
+ while ( my @row = $stmt->fetchrow_array ) {
+        my ($status, $mail, $pass) = @row;
+	next if ($status ne 1);
+	my ($d, $dom) = split /@/, $mail;
+	next unless(grep(/^$dom$/, @activedomains));
+	$log->info("Fetching mails of $mail");
+	system("$instance_root/exec/mail_client/attachextractmail $imapserver $mail $pass");
+	$log->info("DONE fetching all mails for $mail");
+}
+
+$log->info("FETCHED all mails from mail server $imapserver");
+
+	# End transaction and commit changes to DB
+$db->commit or $log->error("Could not commit changed to DB"),die "Could not commit change to DB\n";
+$db->disconnect or $log->error("Could not disconnect from DB"),die"Could not disconnect from DB\n";
+$db = undef;
+$log->debug("DB Finish completed");
+
+unlink($lockfile);

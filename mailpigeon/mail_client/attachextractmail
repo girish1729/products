@@ -1,0 +1,25 @@
+#!/usr/bin/perl 
+
+use strict;
+use warnings;
+# Some gynmastics to locate library .pm file in same dir as this script
+# location
+my $rundir;
+BEGIN { use File::Basename; $rundir = dirname($0); }
+use lib "$rundir";
+use GHIMAPClient;
+
+my $numargs = $#ARGV + 1;
+if($numargs < 3) {
+	die "Usage: $0 <serverip> <username> <password>\n";
+}
+
+my $serverip = shift;
+my $user = shift;
+my $pass = shift;
+
+my ($db, %mailinfo) = GHIMAPClient::talkimap($serverip, $user, $pass);
+if(defined($db)) {
+	GHIMAPClient::insmailattachdb($db, %mailinfo );
+}
+exit 0;

@@ -1,0 +1,3198 @@
+#!/usr/bin/perl 
+
+$|++;
+use IO::Socket;
+use FileHandle;
+use IPC::Open2;
+use Proc::Daemon;
+use Tie::File;
+use Array::Diff;
+use Sys::Syslog;
+use POSIX ":sys_wait_h";
+use File::Copy;
+use File::Path;
+use File::Glob ':glob';
+use DBI;
+use Digest::SHA1 qw(sha1_hex);
+
+
+sub REAPER {
+	my $child;
+# If a second child dies while in the signal handler caused by the
+# first death, we won't get another signal. So must loop here else
+# we will leave the unreaped child as a zombie. And the next time
+# two children die we get another zombie. And so on.
+	while (($child = waitpid(-1,WNOHANG)) > 0) {
+		$Kid_Status{$child} = $?;
+	}
+	$SIG{CHLD} = \&REAPER;  # still loathe SysV
+}
+
+# XXX Global settings
+
+my $socketfile = "/tmp/unixsock";
+
+#------------------------------Utility --------------------------#
+
+
+sub findvals {
+	($token) = @_;
+	tie @fw, "Tie::File", "/etc/fw.conf", mode => O_RDONLY or 
+		die "Could not open file for reading";
+	$idx = $#fw;
+	$cnt = 0;
+	$sectionflag = 0;
+	@values = ();
+	for $var (0 .. $idx) {
+		$_ = $fw[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag  eq 1)) {
+			@tokenvals = @values;
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_;
+			next;
+		}
+		if(/^$token/) {
+			$tok = $&;
+			$sectionflag = 1;
+		}
+	}
+	untie @fw;
+}
+
+sub effectpf {
+	($token, @settings) = @_;
+	tie @pf, "Tie::File", "/etc/pf.conf";
+	$sec = 0, $cnt = 0;
+	for $var (0 .. $#pf) {
+		$_ = $pf[$var];
+		chomp();
+
+		if(/End$token/ and ($sec eq 1)) {
+			splice @pf, $off, $cnt, @settings;
+			@values = (), $cnt = 0, $sec = 0;
+			last;
+		}
+
+		if($sec eq 1) { 
+			$cnt++;
+			next;
+		}
+		if(/Start$token/) {
+			$tok = $&;
+			$off = $var + 1;
+			$sec = 1; 
+		}
+	}
+
+	untie @pf;
+}
+
+#------------------------------Functions--------------------------#
+
+sub savenwconfig {
+
+($intf_value, $ipaddrtext, $masktext, $gwytext) = split /\n/, $_[0];
+
+	chomp($intf_value);
+	chomp($ipaddrtext);
+	chomp($masktext);
+	chomp($gwytext);
+
+	system("/sbin/ifconfig $intf_value $ipaddrtext netmask $masktext");
+
+	tie @hostnameif, "Tie::File", "/etc/hostname.$intf_value";
+	$hostnameif[0] = "inet $ipaddrtext $masktext\n";
+
+	$gwyfound = 0;
+	for(@mygate) {
+		if(/$gwytext/) {
+			$gwyfound = 1;
+			last;
+		}
+	}
+	if($gwyfound eq 0) {
+		push @hostnameif, "\t!/sbin/route add -mpath default $gwytext";
+	}
+	untie @hostnameif;
+	`/bin/chmod 0640 /etc/hostname.$intf_value `;
+	system("/sbin/route delete default");
+	system("/sbin/route delete default $gwytext");
+	system("/sbin/route add default -mpath $gwytext");
+	open F, ">/etc/mygate";
+	print F $gwytext . "\n";
+	close F;
+	tie @f, "Tie::File", "/etc/rc.local";
+	for(@f) {
+		if(/openvpn/) {
+			s/#//;
+		}
+	}
+	untie @f;
+	tie @f, "Tie::File", "/etc/rc.conf.local";
+	for(@f) {
+		if(/pf=/) {
+			$_ = "pf=YES";
+		}
+	}
+	untie @f;
+	print $connection "SUCCESS";
+
+}
+
+sub installvpn {
+	$hostname = `grep ^hostname /etc/fw.conf|cut -d' ' -f2`;
+	$defaultgwy = `grep ^defaultgwy /etc/fw.conf|cut -d' ' -f2`;
+
+	open F, "/etc/myname";
+	print F $hostname;
+	close F;
+
+	$localnet = `grep ^localnet /etc/fw.conf|cut -d' ' -f2`;
+	tie @ipsec, "Tie::File", "/etc/ipsec.conf";
+	for(@ipsec) {
+		if(/^local_net/) {
+			$_ = "local_net = \"$localnet\" ";
+		}
+	}
+	untie @ipsec;
+
+	$dyndns_enable = `grep ^dyndns_enable /etc/fw.conf|cut -d' ' -f2`;
+	if($dyndns_enable =~ /yes/) {
+		$dyndns_host = `grep ^dyndns_host /etc/fw.conf|cut -d' ' -f2`;
+		$dyndns_key = `grep ^dyndns_key /etc/fw.conf|cut -d' ' -f2`;
+		&setdyndns($dyndns_host, $dyndns_key);
+	} else {
+		&setdyndns("DISABLE", " ");
+	}
+
+	&findvals("static_routes");
+	@static_routes = @tokenvals;
+
+	for $row (@static_routes) {
+		$row =~ s/\s+/ /g;
+		($d,$net, $dest) = split / /, $row;
+		system("/sbin/route add $net $dest");
+	}
+	&findvals("iface_aliases");
+	@addaliases = @tokenvals;
+	for(@addaliases) {
+		s/\s+/ /g;	
+		($d, $iface, $ipaddr, $netmask) = split / /;
+		&addalias($iface, $ipaddr, $netmask);
+	}
+
+}
+
+sub addrxlate {
+
+
+	$natip = `grep ^natip /etc/fw.conf|cut -d' ' -f2`;
+	$natenable = `grep ^natenable /etc/fw.conf|cut -d' ' -f2`;
+	$nattype = `grep ^nattype /etc/fw.conf|cut -d' ' -f2`;
+
+	$binat_loca = `grep ^binat_loca /etc/fw.conf|cut -d' ' -f2`;
+	$binat_puba = `grep ^binat_puba /etc/fw.conf|cut -d' ' -f2`;
+
+	$binat_locb = `grep ^binat_locb /etc/fw.conf|cut -d' ' -f2`;
+	$binat_pubb = `grep ^binat_pubB /etc/fw.conf|cut -d' ' -f2`;
+
+	$binat_locc = `grep ^binat_locc /etc/fw.conf|cut -d' ' -f2`;
+	$binat_pubc = `grep ^binat_pubc /etc/fw.conf|cut -d' ' -f2`;
+
+	$binat_locd = `grep ^binat_locd /etc/fw.conf|cut -d' ' -f2`;
+	$binat_pubd = `grep ^binat_pubd /etc/fw.conf|cut -d' ' -f2`;
+	
+	tie @pf, "Tie::File", "/etc/pf.conf";
+	@binat = ();
+
+	push @binat , "pass quick on egress from $binat_loca to any binat-to $binat_puba";
+	push @binat , "pass quick on egress from $binat_locb to any binat-to $binat_pubb";
+	push @binat , "pass quick on egress from $binat_locc to any binat-to $binat_pubc";
+	push @binat , "pass quick on egress from $binat_locd to any binat-to $binat_pubd";
+	for(@pf) {
+		if(/natip=/) {
+			$_ = "natip= \" $natip \" ";
+		}
+		if(/table <ourpublic>/) {
+			$_ =  "table <ourpublic> { @ourpublic } ";
+		}
+	}
+	if($natenable =~ /yes/) {
+		for(@pf) {
+			if(/out/ and !/nat-to/) {
+				if($nattype =~ /single/) {
+					$_ .= " nat-to \$natip";
+				} else {
+					$_ .= " nat-to $nattype <ourpublic> ";
+				}
+			}
+		}
+	} else {
+		for(@pf) {
+			if(/out/) {
+				s/nat-to .*//;
+			}
+		}
+
+	}
+
+	&findvals("ourpublic");
+	@ourpublic = @tokenvals;
+	
+	for(@pf) {
+		if(/XXX BINAT/) {
+			splice @fw, $idx, $cnt, @binat;	
+		}
+	}
+	untie @pf;
+	`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+sub groupsettings {
+
+	$fullaccess_bw = `grep ^fullaccess_bw /etc/fw.conf|cut -d' ' -f2`;
+	$restricted_bw = `grep ^restricted_bw /etc/fw.conf|cut -d' ' -f2`;
+	$custom1_bw = `grep ^custom1_bw /etc/fw.conf|cut -d' ' -f2`;
+	$custom2_bw = `grep ^custom2_bw /etc/fw.conf|cut -d' ' -f2`;
+	$custom3_bw = `grep ^custom3_bw /etc/fw.conf|cut -d' ' -f2`;
+
+	tie @pf, "Tie::File", "/etc/pf.conf";
+	@binat = ();
+
+		for(@pf) {
+		if(/natip=/) {
+			$_ = "natip= \" $natip \" ";
+		}
+		if(/table <ourpublic>/) {
+			$_ =  "table <ourpublic> { @ourpublic } ";
+		}
+	}
+	&findvals("fullaccess_tcp");
+	@fullaccess_tcp = @tokenvals;
+	&findvals("fullaccess_udp");
+	@fullaccess_udp = @tokenvals;
+
+	&findvals("restricted_tcp");
+	@restricted_tcp = @tokenvals;
+	&findvals("restricted_udp");
+	@restricted_udp = @tokenvals;
+
+	&findvals("custom1_tcp");
+	@custom1_tcp = @tokenvals;
+	&findvals("custom1_udp");
+	@custom1_udp = @tokenvals;
+
+	&findvals("custom2_tcp");
+	@custom2_udp = @tokenvals;
+	&findvals("custom2_udp");
+	@custom2_udp = @tokenvals;
+
+	&findvals("custom3_tcp");
+	@custom3_tcp = @tokenvals;
+
+	&findvals("custom3_udp");
+	@custom3_udp = @tokenvals;
+	
+	for(@pf) {
+		if(/XXX GROUPS/) {
+			splice @fw, $idx, $cnt, @binat;	
+		}
+	}
+	untie @pf;
+	`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+sub addcaptiveuser {
+
+	($user, $label,  $paymenttype) = @_;
+	$user =~ s/\s//g;
+	$mac = $host = $label = "";
+
+	my $db = DBI->connect("dbi:Pg:dbname=postgres", "postgres", "panache", {AutoCommit => 1});
+
+	if(!defined($db)) {
+		die "Could not connect to Captive login Postgres db";
+	}
+
+	$sha = sha1_hex($pass);
+
+	$stmt = $db->prepare("delete from captiveusers");
+	$stmt->execute();
+	$stmt = $db->prepare("insert into captiveusers  values(".
+				"'" . $user . "'," . 
+				"'" . $sha. "'," .
+				"'" . $mac . "'," .
+				"'" . $host . "'," .
+				"'" . $label. "'," .
+				"'" .$paymenttype . "');" );
+	$stmt->execute();
+	$db->disconnect;
+	syslog(LOG_INFO, "Added user $user to captiveusers Postgres DB");
+}
+
+sub modifycaptiveuser {
+
+	($user, $label, $host, $mac) = @_;
+	$user =~ s/\s//g;
+
+	my $db = DBI->connect("dbi:Pg:dbname=postgres", "postgres", "panache", {AutoCommit => 1});
+
+	if(!defined($db)) {
+		die "Could not connect to Captive login Postgres db";
+	}
+
+	$stmt = $db->prepare("update captiveusers set hostlabel=" . "'" . $label. "'," .
+				"host=" . "'" . $host . "'," .
+				"macaddr=" . "'" . $mac . "'" . "where login=" . "'" . $user ."';" );
+	$stmt->execute();
+	$db->disconnect;
+	syslog(LOG_INFO, "Added user $user to captiveusers Postgres DB");
+}
+
+
+sub wlport {
+	($tcpport) = @_;
+}
+
+sub wlmac {
+	($mac) = @_;
+}
+
+sub wlurl {
+	($url) = @_;
+}
+
+sub captivesetup {
+	&findvals("captive_users");
+	@captiveusers = @tokenvals;
+	for(@captiveusers) {
+		($user, $pass, $paymenttype) = split /,/;
+		&addcaptiveuser($user,$pass, $paymenttype);
+
+	}
+	&findvals("captive_whitelist");
+	@captivewhite = @tokenvals;
+	for(@captivewhite) {
+		($name, $tcpport, $mac, $url) = split /,/;
+		if($tcpport =~ /\d/) {
+			&wlport($tcpport);
+		}
+		if($mac =~ /\S/) {
+			&wlmac($mac);
+		}
+		if($url =~ /\w/) {
+			&wlurl($url);
+		}
+	}
+
+}
+
+sub userbwcontrol {
+	&findvals("captive_hosts");
+	@captivehosts = @tokenvals;
+	for(@captivehosts) {
+		($user, $clientlabel, $clienthost, $mac, $timelimit, $totalcap, $uplcap, $dlcap, $bwlimit) = split /,/;
+		&modifycaptiveuser($user, $clientlabel, $clienthost, $mac);
+	}
+}
+	
+sub ipsecvpn {
+	&findvals("ipsecvpn_sessions");
+	@ipsecsess = @tokenvals;
+	tie @ipsec, "Tie::File", "/etc/ipsec.conf";
+	for(@ipsecsess) {
+		s/\s+/ /g;
+		($d, $peername, $peernw, $peerip, $mode, $auth, $psk) = split / /;
+		&setup_ipsec_vpn($peername, $peernw, $peerip, $mode, $auth, $psk);
+		
+	}
+	untie @ipsec;
+	@res = readpipe "/sbin/ipsecctl -f /etc/ipsec.conf";
+	if((scalar @res) le 1) {
+		print $connection "SUCCESS";
+	} else {
+		print $connection "NOT";
+	}
+
+}
+	
+sub openvpn {
+
+	$peerip = `grep ^fullaccess_bw /etc/fw.conf|cut -d' ' -f2`;
+	$peernw = `grep ^restricted_bw /etc/fw.conf|cut -d' ' -f2`;
+	$psk = `grep ^custom1_bw /etc/fw.conf|cut -d' ' -f2`;
+
+	tie @ovpn, "Tie::File", "/etc/openvpn/server.conf";
+	for(@ovpn) {
+	}
+	untie @ovpn;
+}
+
+sub senderr {
+	$errstring = $_[0];
+	syslog(LOG_ERR, "ERROR" . $errstring);
+	print $connection "ERROR" ."\n" . $errstring;
+}
+
+sub getuptime {
+	$o = `/usr/bin/uptime|tr -s ' '`;
+	print $connection $o;
+}
+
+sub trunkbundle {
+	@ifs = split / /, $ifaces;
+	$ifstr = "";
+	for(@ifs) {
+		$ifstr .= "trunkport $_ ";
+	
+	}
+	`/sbin/ifconfig trunk0 destroy`;
+	`/sbin/ifconfig trunk0 create`;
+	`/sbin/ifconfig trunk0 trunkproto $proto $ifstr $addr netmask $mask`;
+	open F, ">/etc/hostname.trunk$id";
+	print F "trunkproto $proto $ifstr $addr netmask $mask\n";
+	close F;
+	chmod 0640, "/etc/hostname.trunk$id";
+	
+}
+
+sub addbridge {
+	($id, $ifaces) = @_;
+	@intf = split /,/, $ifaces;
+	for(@intf) {
+		$ifstr .= " add $_";
+	}
+	`/sbin/ifconfig bridge$id create`;
+	`/sbin/ifconfig bridge$id $ifstr`;
+	
+	open F, ">/etc/hostname.bridge$id";
+	print F "$ifstr up\n";
+	close F;
+	chmod 0640, "/etc/hostname.bridge$id";
+}
+
+sub addvlan {
+	($id, $intf, $ip, $mask) = @_;
+	`/sbin/ifconfig vlan$id create`;
+	`/sbin/ifconfig vlan$id vlandev $intf $ip netmask $mask`;
+	
+	open F, ">/etc/hostname.vlan$id";
+	print F "vlandev $intf $ip netmask $mask\n";
+	close F;
+	chmod 0640, "/etc/hostname.vlan$id";
+}
+
+sub addtrunk {
+	($id, $proto, $ip,$netmask,$ifaces) = @_;
+	@intf = split /,/, $ifaces;
+	for(@intf) {
+		$ifstr .= " trunkport $_";
+	}
+	`/sbin/ifconfig trunk$id create`;
+	`/sbin/ifconfig trunk$id trunkproto $proto $ifstr $ip netmask $netmaskmask`;
+	open F, ">/etc/hostname.trunk$id";
+	print F "trunkproto $proto $ifstr $addr netmask $mask\n";
+	close F;
+	chmod 0640, "/etc/hostname.trunk$id";
+	
+}
+
+sub deltrunk {
+	($id) = $_[0];
+	`/sbin/ifconfig trunk$id destroy`;
+	`/bin/rm /etc/hostname.trunk$id`;
+}
+
+sub delvlan {
+	($id) = $_[0];
+	`/sbin/ifconfig vlan$id destroy`;
+	`/bin/rm /etc/hostname.vlan$id`;
+}
+
+sub delbridge {
+	($id) = $_[0];
+	`/sbin/ifconfig bridge$id destroy`;
+	`/bin/rm /etc/hostname.bridge$id`;
+}
+
+sub vlanbridgetrunk {
+	@aliases = `/sbin/ifconfig egress`;
+
+	@vlans = `/sbin/ifconfig vlan`;
+
+	@bridges = `/sbin/ifconfig bridge`;
+
+	@trunks = `/sbin/ifconfig trunk`;
+
+
+	for(@briges) {
+		if(/^\S/) {
+			($bridgeif, @j) = split /:/;
+			push @br, $bridgeif;
+			next;
+		}
+	}
+
+	for(@vlans) {
+		if(/^\S/) {
+			($vlanif, @j) = split /:/;
+			push @vl, $vlanif;
+			next;
+		}
+	}
+
+
+	for(@trunks) {
+		if(/^\S/) {
+			($trunkif, @j) = split /:/;
+			push @tr, $trunkif;
+			next;
+		}
+	}
+
+
+	for(@aliases) {
+		if(/inet /) {
+			s/\s+/ /g;	
+			($d, $d,$ip, @j) = split / /;
+			push @al,$ip;
+		}
+	}
+
+	&delalias(@al);
+
+	for(@br) {
+		&delbridge($_);
+	}
+
+	for(@vl) {
+		&delvlan($_);
+	}
+
+	for(@tr) {
+		&deltrunk($_);
+	}
+
+	&findvals("trunks");
+	@addtrunks = @tokenvals;
+	&findvals("bridges");
+	@addbridges = @tokenvals;
+	&findvals("vlans");
+	@addvlans = @tokenvals;
+	&findvals("iface_aliases");
+	@addaliases = @tokenvals;
+	for(@addaliases) {
+		s/\s+/ /g;	
+		($d, $iface, $ipaddr, $netmask) = split / /;
+		&addalias($iface, $ipaddr, $netmask);
+	}
+
+	for(@addbridges) {
+		s/\s+/ /g;
+		($d,$bridgeid, $ifaces) = split / /;
+		&addbridge($bridgeid, $ifaces);
+	}
+
+	for(@addvlans) {
+		s/\s+/ /g;
+		($d, $vlanid, $iface, $ip,$netmask) = split / /;
+		&addvlan($vlanid, $iface, $ip, $netmask);
+	}
+
+	for(@addtrunks) {
+		s/\s+/ /g;
+		($d, $trunkid, $proto, $ip, $netmask, $ifaces ) = split / /;
+		&addtrunk($trunkid, $proto, $ip,$netmask,$ifaces);
+	}
+
+}
+
+sub dhcpimport {
+	$f = bsd_glob("/var/www/htdocs/upload/*");
+	imove($f, "/etc/dhcpd.conf");
+}
+
+
+sub dhcpsetgeneral {
+	tie @dhcp, "Tie::File", "/etc/dhcpd.conf";
+	for (@dhcp) {
+		chomp();
+		if(/subnet/) {
+			$_ = "subnet $subnet netmask $netmask {";	
+		} elsif(/range/) {
+			$_ = "range $rangest $rangeend;";
+		} elsif(/domain-name-servers/) {
+			$_ = "option domain-name-servers @nameservers;";
+		} elsif(/option routers/) {
+			$_ = "option routers $gwy;";
+		} elsif(/default-lease-time/) {
+			$_ = "default-lease-time $lease;";
+		} elsif(/domain-name/) {
+			$_ = "option  domain-name \"$domain\";";
+		}
+
+	}
+	$#dhcp = 20;
+	untie @dhcp;
+}
+
+sub gethosts {
+	($group) = @_;
+	tie @fw, "Tie::File", "/etc/fw.conf", mode => O_RDONLY or 
+		die "Could not open file for reading";
+
+        $idx = $#fw;
+        $cnt = 0;
+        $sectionflag = 0;
+        @values = (); 
+        for $var (0 .. $idx) {
+                $_ = $fw[$var];
+                chomp();
+
+# Skip blank lines and comments
+                next if(/#/);
+
+                if(/\}/ and ($sectionflag eq 1)) {
+                        if($tok =~ /dhcp_hosts $group/) {
+                                @ghosts = @values;
+                        }
+                        last;
+                }
+
+                if($sectionflag eq 1) {
+                        $hostcnt++;
+                        push @values, $_ . "\n"; 
+                        next;
+                }
+                if(/^dhcp_hosts $group/) {
+                        $tok = $&;
+			$hostoff = $var + 1;
+                        $sectionflag = 1;
+                }
+        }
+	untie @fw;
+ 
+}
+
+sub dhcpconfig {
+	tie @fw, "Tie::File", "/etc/fw.conf", mode => O_RDONLY or 
+		die "Could not open file for reading";
+
+	$idx = $#fw;
+	$cnt = 0;
+	$sectionflag = 0;
+	@values = ();
+	for $var (0 .. $idx) {
+		$_ = $fw[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag eq 1)) {
+			$sectionflag = 0,$cnt = 0;  
+			if($tok =~ /dhcp_groups/) {
+				@dhcpgroups = @values;
+			}
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_ . "\n"; 
+			next;
+		}
+		if(/^dhcp_subnet/) {
+			($tok, $val) = split / /;
+			$subnet = $val;
+		} elsif(/^dhcp_netmask/) {
+			($tok, $val) = split / /;
+			$netmask = $val;
+		} elsif(/^dhcp_gateway/) {
+			($tok, $val) = split / /;
+			$gwy = $val;
+		} elsif(/^dhcp_range/) {
+			($tok, $val1, $val2) = split / /;
+			$rangest = $val1;
+			$rangeend = $val2;
+		} elsif(/^dhcp_domain/) {
+			($tok, $val) = split / /;
+			$domain = $val;
+		} elsif(/^dhcp_nameservers/) {
+			($tok, @val) = split / /;
+			(@nameservers) = @val;
+		} elsif(/^dhcp_leasetime/) {
+			($tok, $val) = split / /;
+			$lease = $val;
+		} elsif(/^dhcp_domainname /) {
+			($tok, $val) = split / /;
+			$domain = $val;
+		}
+
+
+		if(/^dhcp_groups/) {
+			$tok = $&;
+			$sectionflag = 1;
+		}
+	}
+	untie @fw;
+	&dhcpsetgeneral;
+
+	tie @dhcp, "Tie::File", "/etc/dhcpd.conf";
+	for(@dhcpgroups) {
+		s/\s+/ /g;
+		($d, $filename, $server, $name) = split / /;
+		push @dhcp, "## START";
+		push @dhcp, "# XXX $tftpfile ";
+		push @dhcp, " group { ";
+		push @dhcp, "  	filename \"$filename\"; ";
+		push @dhcp, " 	next-server $server; ";
+		push @dhcp, " ";
+
+		&gethosts($name);
+		for $eachhost (@ghosts) {
+			$eachhost =~ s/\s+/ /g;
+			($d, $host, $macid, $ipaddr) = split / /, $eachhost;
+
+			push @dhcp, "	host $host { ";
+			push @dhcp, "	\thardware ethernet $macid ; ";
+			push @dhcp, "	\tfixed-address $ipaddr ; ";
+			push @dhcp, "	\toption host-name \"$host\" ; ";
+			push @dhcp, "	} ";
+
+		}
+
+		push @dhcp, "} ";
+		push @dhcp, " ";
+
+	}
+	push @dhcp, "## XXX END ";
+	push @dhcp, "} ";
+	untie @dhcp;
+
+
+	`/usr/bin/pkill dhcpd ; /usr/sbin/dhcpd`;
+	tie @rcconflocal, "Tie::File", "/etc/rc.conf.local";
+	for(@rcconflocal) {
+		if(/dhcp/) {
+			s/#//;
+		}
+	}
+	untie @rcconflocal;
+}
+
+sub applylogo {
+        $f = bsd_glob('/var/www/htdocs/upload/*');
+        move($f, '/var/www/htdocs/images/logo.png');
+}
+
+sub delayreboot {
+	($t) = $_[0];
+	$t *= 60;
+	sleep($t);
+	exec("/sbin/reboot -q");
+}
+
+sub osghostupld {
+	($ftpsrvr, $anon, $ftpuser, $ftppass ) = split "\n", $_[0];
+	($disk) = split / /,`/sbin/mount`;
+	$disk =~ s/([0-9])([a-z])/$1c/;
+	if($anon =~ /on/) {
+		system("/bin/dd if=$disk bs=32k 2>/tmp/status| /usr/local/bin/curl -sT -  ftp://$ftpsrvr/VPNBee.img");
+	} else {
+		system("/bin/dd if=/dev/$disk bs=32k 2>/tmp/status | /usr/local/bin/curl -sT - $ftpuser:$ftppass ftp://$ftpsrvr/G3vpn.bin");
+	}
+
+}
+
+sub osghostdl {
+	unlink("/tmp/status");
+	($ftpsrvr, $anon, $disk, $ftpuser, $ftppass) = split "\n", $_[0];
+	$ftpsrvr =~ s/\s//g;
+	$disk =~ s/\s//g;
+	$anon =~ s/\s//g;
+	syslog(LOG_INFO, "[$ftpsrvr] [$anon] [$disk] [$ftpuser] [$ftppass]");
+	if($anon =~ /on/) {
+		syslog(LOG_INFO, "/usr/local/bin/curl -s  ftp://$ftpsrvr/VPNBee.img | /bin/dd of=/dev/$disk bs=32k");
+		system("/usr/local/bin/curl -s  ftp://$ftpsrvr/VPNBee.img | /bin/dd of=/dev/$disk bs=32k 2>/tmp/status");
+	} else {
+		system("/usr/local/bin/curl -s  -u ftp://$ftpuser:$ftppass $ftpsrvr/VPNBee.img | /bin/dd of=/dev/$disk bs=32k 2>/tmp/status");
+	}
+}
+
+sub monitctl {
+	($action) = $_[0];
+	if($action =~ /start/) {
+		system("pkill -9 monit");
+		system("/usr/local/bin/monit");
+	} elsif($action =~/restart/) {
+		system("/usr/local/bin/monit reload");
+	} elsif($action =~/unmonitor/) {
+		system("/usr/local/bin/monit unmonitor all");
+	} elsif($action =~/stop/) {
+		system("/usr/local/bin/monit stop all");
+	} else {
+		syslog(LOG_INFO, "Stopping monit");
+		system("pkill -9 monit");
+	}
+
+}
+
+sub monitglobal {
+	($alflg, $mailid, $freq, @albody) = split /\n/, $_[0];
+
+	if($freq =~ /tenminutes/) {
+		$intv = 10 * 60;
+	} elsif($freq =~ /twminutes/) {
+		$intv = 20 * 60;
+	} elsif($freq =~ /forminutes/) {
+		$intv = 40 * 60;
+	} elsif($freq =~ /hourly/) {
+		$intv = 60 * 60;
+	} elsif($freq =~ /bihourly/) {
+		$intv = 120 * 60;
+	}
+tie @monit, "Tie::File", "/etc/monitrc";
+	$last = $#monit;
+	for $idx (0 .. $last) {
+		$_ = $monit[$idx];
+		chomp();
+		next if(/^#/);
+		if(/^set daemon/) {
+			$monit[$idx] = "set daemon $intv";
+			syslog(LOG_INFO, "interval $_");
+		} elsif(/^set alert/) {
+			$monit[$idx] = "set alert $mailid";
+			syslog(LOG_INFO, "mailid $_");
+		} elsif(/^set mail-format/) {
+			$off = $idx + 4;
+		}
+ 	
+	}
+	$monit[$off] = qq(@albody);
+	untie @monit;
+	`/usr/local/bin/monit -c /etc/monitrc reload`;
+
+}
+
+sub monitdaemons {
+	($apache, $clamd, $grey, $spamd,
+		   $spamlogd, $proxy) = split /\n/, $_[0];
+
+tie @monit, "Tie::File", "/etc/monitrc";
+	$last = $#monit;
+	@tr = ();
+	for $idx (0 .. $last) {
+		$_ = $monit[$idx];
+		chomp();
+		next if(/^#/);
+		if(/spamd.wrap/) {
+		} elsif(/check process apache/) {
+			if($apache =~ /on/) {
+			push @tr, 
+qw(
+ # XXX Apache
+check process apache with pidfile /var/www/logs/http.pid
+   start program = "/usr/sbin/httpd -DSSL"
+   stop program = "/usr/bin/pkill httpd"
+              if cpu > 60% for 2 cycles then alert
+              if cpu > 80% for 5 cycles then restart
+              if mem > 100 MB for 5 cycles then stop
+              if loadavg(5min) greater than 10.0 for 8 cycles then stop
+   if 5 restarts within 5 cycles then timeout
+);
+
+
+			} else {
+				$_ = '#' . $_;
+				$ln = $monit[$idx + 1] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 2] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 3] ;
+				$ln = '#' . $ln;
+			}
+		} elsif(/check process sshd/) {
+			if($sshd =~ /on/) {
+			push @tr, 
+qq(
+# SSHD
+ check process sshd with pidfile /var/run/sshd.pid
+   start program  "/usr/sbin/sshd "
+   stop program  "/usr/bin/pkill sshd"
+   if failed port 22 protocol ssh then restart
+   if 5 restarts within 5 cycles then timeout
+);
+
+
+			} else {
+				$_ = '#' . $_;
+				$ln = $monit[$idx + 1] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 2] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 3] ;
+				$ln = '#' . $ln;
+			}
+		} 
+	}
+	push @monit, @tr;
+
+	untie @monit;
+	`/usr/local/bin/monit -c /etc/monitrc reload`;
+
+}
+
+sub monitsystem {
+		
+	($cpu, $mem, $swap, $nw, $dfslash, $dfvar)
+		 = split /\n/, $_[0];
+tie @monit, "Tie::File", "/etc/monitrc";
+	for (@monit) {
+		chomp();
+# Leave comments out
+		next if(/^#/);
+		if(/cpu usage \(user\)/) {
+			s/(\d+)%/$cpu%/;
+		} elsif(/memory usage/) {
+			s/(\d+)%/$mem%/;
+		} elsif(/device rootfs/) {
+			s/(\d+)%/$dfslash%/;
+		} elsif(/device varfs/) {
+			s/(\d+)%/$dfvar%/;
+		} elsif(/icmp type echo/) {
+			s/timeout (\d+)/timeout $nw/;
+		} 
+	}
+	untie @monit;
+	`/usr/local/bin/monit -c /etc/monitrc reload`;
+
+}
+
+sub pinghost {
+        ($h) = @_;
+        @out = `/sbin/ping -c 10 -i 0.2 -w 1 $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub tracehost {
+        ($h) = @_;
+        @out = `usr/sbin/traceroute -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub sing {
+        ($h) = @_;
+        @out = `usr/local/bin/sing -c 10 -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub hping {
+        ($h) = @_;
+        @out = `usr/local/sbin/hping -c 10 -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub bing {
+        ($h) = @_;
+        @out = `usr/local/sbin/bing -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub fping {
+        ($h) = @_;
+        @out = `usr/local/sbin/fping -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub nmap {
+        ($h) = @_;
+        @out = `usr/local/bin/nmap -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub tcptraceroute {
+        ($h) = @_;
+        @out = `usr/local/bin/tcptraceroute -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub set_ip {
+	($intf, $ip, $mask) = split /\n/, $_[0];
+	$ret = system("/sbin/ifconfig $intf $ip netmask $mask");
+	tie @h, "Tie::File", "/etc/hostname.$intf";
+	$h[0] = "inet $ip $mask";
+	untie @h;
+	`/bin/chmod 0640 /etc/hostname.$intf`;
+}
+
+sub addmpath {
+	($gwy1, $gwy2, $gwy3, $gwy4, $if1, $if2, $if3, $if4
+	) = split /\n/, $_[0];
+
+	chomp($if1);
+	$if1 =~ s/\s//;
+	chomp($if2);
+	$if2 =~ s/\s//;
+	chomp($if3);
+	$if3 =~ s/\s//;
+	chomp($if4);
+	$if4 =~ s/\s//;
+
+	@r = `/usr/bin/netstat -rn -f inet|grep default`;
+	for(@r) {
+		s/\s+/ /g;
+		($d, $gwy) = split / /;
+		system("/sbin/route delete default $gwy");
+	}
+
+	if($gwy1 =~ /\d/) {
+		system("/sbin/route add -mpath default $gwy1");
+		tie @hostnameif, 'Tie::File', "/etc/hostname.$if1";
+		$added = 0;
+		for(@hostnameif) {
+			if(/route add/) {
+				$_ = "\t!/sbin/route add -mpath default $gwy1";
+				$added = 1;
+			}
+		}
+		if($added eq 0) {
+			push @hostnameif, "\t!/sbin/route add -mpath default $gwy1";
+		}
+		untie @hostnameif;
+		open F, ">/etc/mygate";
+		print F $gwy1 . "\n";
+		close F;
+	}
+	if($gwy2 =~ /\d/) {
+		system("/sbin/route add -mpath default $gwy2");
+		tie @hostnameif, 'Tie::File', "/etc/hostname.$if2";
+		$added = 0;
+		for(@hostnameif) {
+			if(/route add/) {
+				$_ = "\t!/sbin/route add -mpath default $gwy2";
+				$added = 1;
+			}
+		}
+		if($added eq 0) {
+			push @hostnameif, "\t!/sbin/route add -mpath default $gwy2";
+		}
+		untie @hostnameif;
+	}
+	if($gwy3 =~ /\d/) {
+		system("/sbin/route add -mpath default $gwy3");
+		tie @hostnameif, 'Tie::File', "/etc/hostname.$if3";
+		$added = 0;
+		for(@hostnameif) {
+			if(/route add/) {
+				$_ = "\t!/sbin/route add -mpath default $gwy3";
+				$added = 1;
+			}
+		}
+		if($added eq 0) {
+			push @hostnameif, "\t!/sbin/route add -mpath default $gwy3";
+		}
+		untie @hostnameif;
+	}
+	if($gwy4 =~ /\d/) {
+		system("/sbin/route add -mpath default $gwy4");
+		tie @hostnameif, 'Tie::File', "/etc/hostname.$if4";
+		$added = 0;
+		for(@hostnameif) {
+			if(/route add/) {
+				$_ = "\t!/sbin/route add -mpath default $gwy4";
+				$added = 1;
+			}
+		}
+		if($added eq 0) {
+			push @hostnameif, "\t!/sbin/route add -mpath default $gwy4";
+		}
+		untie @hostnameif;
+	}
+}
+
+# XXX to be finished
+sub sshtundel {
+	@deltuns = split /\n/, $_[0];
+	
+}
+
+
+# XXX to be finished
+sub listsshtuns {
+	
+}
+
+sub setupsshvpn {
+	($peername, $peernw, $peerip) = split /\n/, $_[0];
+	`/usr/bin/ssh -f -w 0:0 $peerip true`;
+	`/sbin/ifconfig tun0 10.1.1.1 10.1.1.2 netmask 255.255.255.252`;
+	`/bin/route add $peernw 10.1.1.2`;
+
+}
+
+sub listipsecsessions {
+	@out = `/sbin/ipsecctl -sa`;
+	$line = join "\n", @out;
+	print $connection $line;
+}
+
+
+sub listvpntuns {
+	tie @ipsec, "Tie::File", "/etc/ipsec.conf", mode => O_RDONLY;
+	@tuns = ();
+
+	for $var (0..$#ipsec) {
+		$_ = $ipsec[$var];
+		chomp();
+		if(/XXX (\S+) \[(\w+)\]/) {
+			push @tuns, $1 . "," . $2 . "," . $ipsec[$var + 1] . "," . $ipsec[$var + 2] . "," . $ipsec[$var + 3] ;
+		}
+	}
+	untie @ipsec;
+	$line = join "\n", @tuns;
+	print $connection $line;
+}
+
+sub setup_ipsec_vpn {
+	($peername, $peernw, $peerip, $mode, $auth, $psk) = @_;
+
+	$peerip =~ s/\s//g;
+	$peernw =~ s/\s//g;
+	if($mode =~ /erver/) {
+		push @ipsec, "# XXX $peername [Server]";
+		push @ipsec, "${peername}_net=\"$peernw\"";
+		push @ipsec, "ike passive esp from \$local_net to \$${peername}_net psk $psk";
+	} else {
+		push @ipsec, "# XXX $peername [Client]";
+		push @ipsec, "${peername}_remoteip=\"$peerip\"";
+		push @ipsec, "${peername}_net=\"$peernw\"";
+		push @ipsec, "ike dynamic esp from \$local_net to \$${peername}_net peer \$${peername}_remoteip psk $psk";
+	}
+	push @ipsec, " ";
+
+}
+
+sub ipsec_vpn_del {
+	$tun = $_[0];
+	($name, $mode) = split /_/, $tun;
+	if($mode =~ /server/) {
+		$off = 3;
+	} else {
+		$off = 4;
+	}
+	tie @ipsec, "Tie::File", "/etc/ipsec.conf";
+	for $idx (0..$#ipsec) {
+		$_ = $ipsec[$idx];
+		if(/$name/) {
+			splice @ipsec, $idx, $off;
+			last;
+		}
+	
+	}
+	untie @ipsec;
+	system("/sbin/ipsecctl -f /etc/ipsec.conf");
+	
+}
+
+sub ovpntundel {
+	$tun =  $_[0];
+	`/usr/bin/pkill -f $tun`;
+	
+}
+
+sub openvpn_servparms {
+	tie @ovpn, "Tie::File", "/etc/openvpn/server.conf", mode => O_RDONLY;
+	for(@ovpn) {
+		if(/route/) {
+			 $_ =~ /route\s+(\S+)\s+(\S+)\"/;
+			$ourip = $1;
+			$ourmask = $2;
+		} elsif(/^server/) {
+			$_ =~ /server\s+(\S+)\s+(\S+)/;
+			$poolip = $1;
+			$poolmask = $2;
+		}
+	}
+	untie @ovpn;
+
+	$line = join "\n", $ourip, $ourmask, $poolip, $poolmask;
+	print $connection $line;
+
+}
+
+sub userbw_sessions {
+	open F, "/sbin/pfctl -t captivehosts -vTs";
+	@stats = <F>;
+	close F;
+
+	@ipstats = ();
+	for $idx (0..$#stats) {
+		$_ = $stats[$idx];
+		chomp();
+		if(/^   (\d.*)$/) {
+			$ip = $1;
+		} elsif(/Cleared:.*?(\S.*)$/) {
+			$start = $1;
+			push @ipstats, "$ip, $start,,,," if($stats[$idx + 1] !~ /Block/);
+		} elsif(/In\/Pass:.*Packets: (\d+).*Bytes: (\d+)/) {
+			$bytesin = $2;
+			$inpkt = $1;
+		} elsif(/Out\/Pass:.*Packets: (\d+).*Bytes: (\d+)/) {
+			$bytesout = $2;
+			$outpkt = $1;
+			push @ipstats, "$ip, $start, $bytesin, $inpkt, $bytesout, $outpkt";
+		}	
+	}
+
+	$line = join "\n", @ipstats;
+	print $connection $line;
+}
+
+sub pptpl2tp_sessions {
+
+	@o = `/usr/sbin/npppctl session all`;
+
+	$numsess = $#o / 16;
+
+	$cnt = 1;
+	@allsess = ();
+	for($st = 0; $cnt <= $numsess; $st += 17) {
+		($d, $user) = split /: /, $o[$st + 2] ;
+		($d, $intf) = split /: /, $o[$st + 4] ;
+		($d, $tunip) = split /: /, $o[$st + 5] ;
+		($d, $proto) = split /: /, $o[$st + 6] ;
+		($d, $fromip) = split /: /, $o[$st + 7] ;
+		$fromip =~ s/:.*//;
+		($d, $starttime) = split /: /, $o[$st + 8] ;
+		($d, $elapsed) = split /: /, $o[$st + 9] ;
+		($d, $inbytes) = split /: /,$o[$st + 10] ;
+		($d, $inpkt) = split /: /,$o[$st + 11] ;
+		($d, $outbytes) = split /: /,$o[$st + 13] ;
+		($d, $outpkt) = split /: /,$o[$st + 14] ;
+
+		push @allsess, "$user,$intf,$proto,$tunip,$fromip,$starttime,$elapsed,$inbytes,$inpkt,$outbytes,$outpkt";
+		$cnt++;
+	}
+	$line = join "\n", @allsess;
+	print $connection $line;
+
+}
+
+sub pptpl2tp_set {
+	tie @fw, "Tie::File", "/etc/fw.conf", mode => O_RDONLY or 
+		die "Could not open file for reading";
+
+	$idx = $#fw - 1;
+	$cnt = 0;
+	$sectionflag = 0;
+	for $var (0 .. $idx) {
+		$_ = $fw[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag eq 1)) {
+			$sectionflag = 0,$cnt = 0;  
+			if($tok =~ /tun_users/) {
+				@tunusers = @values;
+			}
+			next;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_ . "\n"; 
+			next;
+		}
+		if(/^pptp_start/) {
+			($tok, $val) = split / /;
+			$pptpstart = $val;
+		} elsif(/^pptp_end/) {
+			($tok, $val) = split / /;
+			$pptpend = $val;
+		} elsif(/^l2tp_start/) {
+			($tok, $val) = split / /;
+			$l2tpstart = $val;
+		} elsif(/^l2tp_end/) {
+			($tok, $val) = split / /;
+			$l2tpend = $val;
+		} elsif(/^dns_servers/) {
+			($tok, $val) = split / /;
+			$dns = $val;
+		} elsif(/^nbns_servers/) {
+			($tok, $val) = split / /;
+			$netbios = $val;
+		}
+
+		if(/^tun_users/) {
+			$tok = $&;
+			$sectionflag = 1;
+		}
+	}
+	untie @fw;
+	tie @users, "Tie::File", "/etc/npppd/npppd-users";
+	@users = ();
+	for(@tunusers) {
+		($user, $pass, $ip) = split /,/;
+		$user =~ s/[\s\n]//g;
+		$pass =~ s/[\s\n]//g;
+		$ip =~ s/[\s\n]//g;
+		push @users, "$user:\\";
+		push @users, "	:password=$pass:\\";
+		push @users, "	:framed-ip-address=$ip:";
+		push @users, " ";
+	}
+	untie @users;
+	$dns =~ s/,/ /g;
+	$netbios =~ s/,/ /g;
+	tie @npppd, "Tie::File", "/etc/npppd/npppd.conf";
+	for $idx (0..$#npppd) {
+		$_ = $npppd[$idx];
+
+		if(/L2TPIPCP {/) {
+			$npppd[$idx + 1] = "		pool-address $l2tpstart-$l2tpend";
+			$npppd[$idx + 2] = "		dns-servers $dns";
+			$npppd[$idx + 3] = "		nbns-servers $netbios";
+		} elsif(/PPTPIPCP {/) {
+			$npppd[$idx + 1] = "		pool-address $pptpstart-$pptpend";
+			$npppd[$idx + 2] = "		dns-servers $dns";
+			$npppd[$idx + 3] = "		nbns-servers $netbios";
+		} elsif(/PPTPIPCP$/) {
+           		$npppd[$idx] = "	interface tun0 address $pptpstart ipcp PPTPIPCP";
+		} elsif(/L2TPIPCP$/) {
+           		$npppd[$idx] = "	interface tun1 address $l2tpstart ipcp L2TPIPCP";
+		}
+
+	}
+	untie @npppd;
+}
+
+
+# XXX not finished
+sub openvpn_servparams {
+}
+
+sub setupopenvpn_client {
+	($peerip) = $_[0];
+	system("/usr/local/sbin/openvpn --daemon --config /etc/openvpn/client.conf --remote $peerip");
+
+}
+
+sub setupopenvpn_serv {
+	($ourip, $ourmask, $poolip, $poolmask)
+		= split /\n/, $_[0];
+	tie @ovpn, "Tie::File", "/etc/openvpn/server.conf";
+	for(@ovpn) {
+		if(/route/) {
+			$_ = "push \"route $ourip $ourmask\" ";
+		} elsif(/^server/) {
+			$_ = "server $poolip $poolmask";
+		}
+	}
+	untie @ovpn;
+	system("/sbin/pkill -f server.conf");
+	system("/usr/local/sbin/openvpn --daemon --config /etc/openvpn/server.conf");
+
+}
+
+sub listopenvpntuns {
+	tie @openvpn, "Tie::File", "/etc/openvpn/server.conf", mode => O_RDONLY;
+	@tuns = ();
+
+	for $var (0..$#openvpn) {
+		$_ = $ipsec[$var];
+		chomp();
+		if(/XXX (\S+)/) {
+			push @tuns, $1 . "," . $openvpn[$var + 1];
+		}
+	}
+	untie @openvpn;
+	$line = join "\n", @tuns;
+	print $connection $line;
+}
+
+sub listsshvpntuns {
+	$line = join "\n", @tuns;
+	print $connection $line;
+}
+
+sub ntputctime {
+	($ntptoggle, $utctoggle) = @_;
+	if($ntptoggle eq "yes") {
+		system("pkill ntpd");
+		system("/usr/sbin/ntpd");
+	} else {
+		system("pkill ntpd");
+	}
+	if($utctoggle eq "yes") {
+ 		`/bin/rm /etc/localtime 2>/dev/null`;
+	} else {
+		;
+	}
+}
+
+sub set_timezone {
+	($zone) = $_[0];
+ 	`/bin/rm /etc/localtime 2>/dev/null`;
+        `ln -s /usr/share/zoneinfo/$zone /etc/localtime`;
+ 
+}
+
+sub settime {
+	($time) = $_[0];
+        `/bin/date $time`;
+ 
+}
+
+sub show_filt_tcpdump {
+	($host, $proto, $port, $type) = split /\n/, $_[0];
+	if($type =~ /and/i) {
+		$parms = "host $host and $proto and port $port";
+	} else {
+		$parms = "host $host or $proto or port $port";
+	}
+	@lines = `/usr/sbin/tcpdump -tt -qnIo -c 25 $parms`;
+	print $connection @lines;
+ 
+}
+
+
+sub show_tcpdump {
+	@lines = `/usr/sbin/tcpdump -tt -qnIo -c 25`;
+	print $connection @lines;
+ 
+}
+
+sub setrelayd {
+
+	tie @fw, "Tie::File", "/etc/fw.conf", mode => O_RDONLY or 
+		die "Could not open file for reading";
+
+	$idx = $#fw - 1;
+	$cnt = 0;
+	$sectionflag = 0;
+	for $var (0 .. $idx) {
+		$_ = $fw[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag eq 1)) {
+			$sectionflag = 0,$cnt = 0;  
+			if($tok =~ /server_lb/) {
+				@serverlb = @values;
+			}
+			@values = (); 
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_ . "\n"; 
+			next;
+		}
+		if(/^server_lb/) {
+			$tok = $&;
+			$sectionflag = 1;
+		}
+	}
+	untie @fw;
+
+	tie @relayd, "Tie::File", "/etc/relayd.conf";
+	@relayd = ();
+	push @relayd, "interval 30";
+	push @relayd, "timeout 10000";
+	push @relayd, "";
+
+	for(@serverlb) {
+		($name, $proto, $algo, $meth, $itvl, $hosta, $hostb, $hostc, $hostd) = split / /;
+		$hosta =~ s/\n//g;
+		$hostb =~ s/\n//g;
+		$hostc =~ s/\n//g;
+		$hostd =~ s/\n//g;
+		$name =~ s/[\n\s]//g;
+		push @relayd, "table <$name> { $hosta $hostb $hostc $hostd }";
+		push @relayd, "";
+		push @relayd, "relay \"$name\" {";
+		push @relayd, "\tlisten on 0.0.0.0 port $proto ";
+		push @relayd, "\tforward to <$name> mode $algo check $meth interval $itvl";
+		push @relayd, "} ";
+		push @relayd, "";
+	
+	}
+
+	untie @relayd;
+	system("/sbin/pkill relayd");
+	system("/usr/sbin/relayd");
+ 
+}
+
+sub savevar {
+	system("/sbin/mount -o rw /");
+	system("/bin/rm /ramdisk/var.tar.gz");
+	system("/bin/tar zcpf /ramdisk/var.tar.gz /var");
+	system("/sbin/mount -o ro /");
+}
+
+sub addalias {
+	($intf, $ip, $mask) = @_;
+	`/sbin/ifconfig $intf alias $ip netmask $mask`;
+	tie @if, "Tie::File", "/etc/hostname.$intf";
+	push @if, "inet alias $ip $mask";
+	untie @if;
+	
+}
+
+sub delalias {
+	(@aliases) = @_;
+	for(@aliases) {
+		($intf, $addrline) = split /:/;
+		($d, $d, $addr, $mask) = split /_/, $addrline;
+
+		`/sbin/ifconfig $intf delete $addr`;
+		tie @intf, "Tie::File", "/etc/hostname.$intf";
+		for $line (0..$#intf) {
+			$_ = $intf[$line];
+			chomp();
+			if(/$addr/) {
+				splice @intf, $line, 1;
+				last;
+			}
+		}
+		untie @intf;
+	}
+}
+
+sub start_dltest {
+	system("/usr/local/bin/wget --background -o /dev/null http://ftp.jaist.ac.jp/pub/OpenBSD/5.0/i386/install53.iso");
+	sleep(20);
+	system("/usr/bin/pkill wget");
+}
+
+sub start_upltest {
+	$foo = new String::Random;
+	$r = $foo->randpattern("cccccccc");
+	syslog(LOG_INFO, "Creating file $r");
+	system("/usr/local/bin/curl -sT /dev/zero ftp://g3tech.in/upltest/$r&");
+	syslog(LOG_INFO, "started curl...");
+	sleep(20);
+	system("/usr/bin/pkill curl");
+
+}
+
+sub scourlog {
+	`/usr/local/bin/scourlog`;
+}
+
+
+sub labelsandgroups {
+	@linespf = ();
+
+	&findvals("fullaccess ");
+	@full = @tokenvals;
+	@tok = ();
+	for(@full) {
+		s/\s+/ /g;
+		($d, $ip) = split / /;
+		push @tok, "\t$ip\n";
+
+	}
+	push @linespf, "table <fullaccess> counters {";
+	push @linespf, @tok;
+	push @linespf, "}";
+	push @linespf, "";
+
+	&findvals("restricted ");
+	@rest = @tokenvals;
+	@tok = ();
+	for(@full) {
+		s/\s+/ /g;
+		($d, $ip) = split / /;
+		push @tok, "\t$ip";
+	}
+	push @linespf, "table <restricted> counters {";
+	push @linespf, @tok;
+	push @linespf, "}";
+	push @linespf, "";
+
+	&findvals("custom1 ");
+	@custom1 = @tokenvals;
+	@tok = ();
+	for(@full) {
+		s/\s+/ /g;
+		($d, $ip) = split / /;
+		push @tok, "\t$ip";
+	}
+	push @linespf, "table <custom1> counters {";
+	push @linespf, @tok;
+	push @linespf, "}";
+	push @linespf, "";
+
+	&findvals("custom2 ");
+	@custom2 = @tokenvals;
+	@tok = ();
+	for(@full) {
+		s/\s+/ /g;
+		($d, $ip) = split / /;
+		push @tok, "\t$ip";
+	}
+
+	push @linespf, "table <custom2> counters {";
+	push @linespf, @tok;
+	push @linespf, "}";
+	push @linespf, "";
+
+	&findvals("custom3 ");
+	@custom3 = @tokenvals;
+	@tok = ();
+	for(@full) {
+		s/\s+/ /g;
+		($d, $ip) = split / /;
+		push @tok, "\t$ip";
+	}
+
+	push @linespf, "table <custom3> counters {";
+	push @linespf, @tok;
+	push @linespf, "}";
+	push @linespf, "";
+
+# Now modify pf.conf
+	&effectpf("labelsandgroups", @linespf);
+	`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+sub macfilt {
+	@linespf = ();
+	&findvals("macaddr ");
+	@mac = @tokenvals;
+	for(@mac) {
+		s/\s+/ /g;
+		($d, $d, $label) = split / /;
+		push @linespf, "pass on egress tagged $label";
+	}
+
+# Now modify pf.conf
+	&effectpf("MacFilt", @linespf);
+	`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+
+sub groupsettings {
+	@linespf = ();
+	&findvals("fullaccess_tcp");
+	@fulltcp = @tokenvals;
+	$ln = join ",", @fulltcp;
+	push @linespf," fullaccess_tcp = \"{ $ln }\"";
+
+	&findvals("restricted_tcp");
+	@resttcp = @tokenvals;
+	$ln = join ",", @resttcp;
+	push @linespf," restricted_tcp = \"{ $ln }\"";
+
+	&findvals("custom1_tcp");
+	@cust1tcp = @tokenvals;
+	$ln = join ",", @cust1tcp;
+	push @linespf," custom1_tcp = \"{ $ln }\"";
+
+	&findvals("custom2_tcp");
+	@cust2tcp = @tokenvals;
+	$ln = join ",", @cust2tcp;
+	push @linespf," custom2_tcp = \"{ $ln }\"";
+
+	&findvals("custom3_tcp");
+	@cust3tcp = @tokenvals;
+	$ln = join ",", @cust3tcp;
+	push @linespf," custom3_tcp = \"{ $ln }\"";
+
+	&findvals("fullaccess_udp");
+	@fulludp = @tokenvals;
+	$ln = join ",", @fulludp;
+	push @linespf," fullaccess_udp = \"{ $ln }\"";
+
+	&findvals("restricted_udp");
+	@restudp = @tokenvals;
+	$ln = join ",", @fulltcp;
+	push @linespf," fullaccess_udp = \"{ $ln }\"";
+
+	&findvals("custom1_udp");
+	@cust1udp = @tokenvals;
+	$ln = join ",", @cust1udp;
+	push @linespf," custom1_udp = \"{ $ln }\"";
+
+	&findvals("custom2_udp");
+	@cust2udp = @tokenvals;
+	$ln = join ",", @cust2udp;
+	push @linespf," custom2_udp = \"{ $ln }\"";
+
+	&findvals("custom3_udp");
+	@cust3udp = @tokenvals;
+	$ln = join ",", @cust3udp;
+	push @linespf," custom3_udp = \"{ $ln }\"";
+
+# Now modify pf.conf
+	&effectpf("groupsettings", @linespf);
+	`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+sub pfsetup {
+	@linespf = ();
+	$tcpclosed = `grep ^tcpclosed fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout tcp.closed $tcpclosed";
+
+	$tcpclosing = `grep ^tcpclosing fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout tcp.closing $tcpclosing";
+
+	$tcpest = `grep ^tcpest fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout tcp.established $tcpest";
+
+	$tcpfinwait = `grep ^tcpfinwait fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout tcp.finwait $tcpfinwait";
+
+	$tcpfirst = `grep ^tcpfirst fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout tcp.first $tcpfirst";
+
+	$tcpopening = `grep ^tcpopening fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout tcp.opening $tcpopening";
+
+	$icmperr = `grep ^icmperr fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout icmp.error $icmperr";
+
+	$icmpfirst = `grep ^icmpfirst fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout icmp.first $icmpfirst";
+
+	$udpfirst = `grep ^udpfirst fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout udp.first $udpfirst";
+
+	$udpsingle = `grep ^udpsingle fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout udp.single $udpsingle";
+
+	$udpmultiple = `grep ^udpmultiple fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout udp.multiple $udpmultiple";
+
+	$otherfirst = `grep ^otherfirst fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout other.first $otherfirst";
+
+	$othersingle = `grep ^othersingle fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout other.single $othersingle";
+
+	$othermultiple = `grep ^othermultiple fw.conf|cut -d' ' -f2`;
+	push @linespf, "set timeout other.multiple $othermultiple";
+
+	$statepolicy = `grep ^statepolicy fw.conf|cut -d' ' -f2`;
+	$maxmss = `grep ^maxmss fw.conf|cut -d' ' -f2`;
+	$minttl = `grep ^minttl fw.conf|cut -d' ' -f2`;
+	$nodf = `grep ^nodf fw.conf|cut -d' ' -f2`;
+	$randomid = `grep ^randomid fw.conf|cut -d' ' -f2`;
+	$asstcp = `grep ^asstcp fw.conf|cut -d' ' -f2`;
+	$optype = `grep ^optype fw.conf|cut -d' ' -f2`;
+	push @linespf, "set optimization $optype";
+	$reass = `grep ^reass fw.conf|cut -d' ' -f2`; 
+	$stpolicy = `grep ^stpolicy fw.conf|cut -d' ' -f2`;
+	$blockpolicy = `grep ^blockpolicy fw.conf|cut -d' ' -f2`;
+	push @linespf, "set block-policy $blockpolicy";
+	$limstates = `grep ^limstates fw.conf|cut -d' ' -f2`;
+	push @linespf, "set limit states $limstates";
+	$limfrags = `grep ^limfrags fw.conf|cut -d' ' -f2`;
+	push @linespf, "set limit frags $limfrags";
+
+	&findvals("fwrule_options");
+	@fwopts = @tokenvals;
+	&findvals("tcp_state_tracking");
+	@stopts = @tokenvals;
+	&findvals("fwrule_addrpool");
+	@addrpool = @tokenvals;
+
+# Now modify pf.conf
+	&effectpf("pfadvanced", @linespf);
+	`/sbin/pfctl -f /etc/pf.conf`;
+}
+
+
+sub fwrules {
+        @linespf = ();
+        &findvals("fw_rules");
+        @fwrules = @tokenvals;
+
+        for(@fwrules) {
+                 ($rulename, $dir, $iface, $srcip, $srcport,
+                 $dstip, $dstport, $action, $proto ) = split / /;
+                $dir = "" if($dir =~ /both/);
+                $srcip = lc($srcip);
+                $dstip = lc($dstip);
+                if($srcip =~ /[a-zA-Z]/) {
+                        $srcip = "<$srcip>";
+                }
+                if($dstip =~ /[a-zA-Z]/) {
+                        $dstip = "<$dstip>";
+                }
+
+                if($proto =~ /icmp/i) {
+                        push @linespf, "$action $dir on $iface inet proto $proto from $srcip to $dstip";
+                } else {
+                        push @linespf, "$action $dir on $iface inet proto $proto from $srcip port $srcport to $dstip port $dstport";
+                }
+        }
+# Now modify pf.conf
+        &effectpf("Rules", @linespf);
+        #`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+sub qos {
+	@linespf = ();
+	&findvals("qos_rules");
+	@qosrules = @tokenvals;
+
+ 	push @linespf, "altq on $intf hfsc bandwidth 100% queue { fullaccess, restricted, custom1, custom2, custom3 }";
+
+        push @linespf, "match in from <fullaccess> to any tag fullaccess";
+        push @linespf, "match in from <restricted> to any tag restricted";
+        push @linespf, "match in from <custom1> to any tag custom1";
+        push @linespf, "match in from <custom2> to any tag custom2";
+        push @linespf, "match in from <custom3> to any tag custom3";
+
+        push @linespf, "queue fullaccess bandwidth 40% hfsc(default red upperlimit 10Mb)";
+        push @linespf, "queue restricted bandwidth 5% priority 7 hfsc(upperlimit 5%)"; 
+        push @linespf, "queue custom1 bandwidth 15% priority 7 hfsc(upperlimit 15%)";
+        push @linespf, "queue custom2 bandwidth 15% priority 7 hfsc(upperlimit 15%)";
+        push @linespf, "queue custom3 bandwidth 15% priority 7 hfsc(upperlimit 15%)";
+	push @linespf, " ";
+        push @linespf, "pass on $intf from any to any tagged fullaccess set queue fullaccess";
+        push @linespf, "pass on $intf re0 from any to any tagged restricted set queue restricted";
+        push @linespf, "pass on $intf re0 from any to any tagged custom1 set queue custom1";
+        push @linespf, "pass on $intf re0 from any to any tagged custom2 set queue custom2";
+        push @linespf, "pass on $intf re0 from any to any tagged custom3 set queue custom3";
+
+	&effectpf("QoS", @linespf);
+	`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+sub portfwd {
+        @linespf = (); 
+        @fwdrules = (); 
+        &findvals("port_fwd");
+        for(@tokenvals) {
+                s/\s+/ /g;
+        ($name, $iface, $pubip, $localip , $localportstart, 
+        $localportend, $redirip, $redirportstart, $redirportend,
+        $proto) = split /,/;
+                $localip = lc($localip);
+                $redirip = lc($redirip);
+                if($localip =~ /[a-zA-Z]/) {
+                        $localip = "<$localip>";
+                }
+                if($redirip =~ /[a-zA-Z]/) {
+                        $redirip = "<$redirip>";
+                }
+
+
+                push @linespf, "pass in on $iface inet proto $proto from $pubip to $localip port $localportstart:$localportend rdr-to $redirip port $redirportstart:$redirportend";
+        }   
+# Now modify pf.conf
+        &effectpf("PortFwd", @linespf);
+        #`/sbin/pfctl -f /etc/pf.conf`;
+}
+
+sub captive {
+	@linespf = ();
+	&findvals("captive_hosts");
+	@captivehosts = @tokenvals;
+
+# Now modify pf.conf
+	&effectpf("Captive", @linespf);
+	`/sbin/pfctl -f /etc/pf.conf`;
+
+}
+
+sub qsess {
+
+	@qsess = `/sbin/pfctl -vsq`;
+
+	for $idx (0..$#qsess) {
+		$_ = $qsess[$idx];
+		if(/^queue.*?(\S+) on (\S+) bandwidth (\S+) (.*)$/) {
+			$qname = $1;
+			$iface = $2;
+			$bw = $3;
+			$parms = $4;
+			if($parms =~ /\S/) {
+				if($parms =~ /\{/) {
+					$parms =~ /(.*)\{(.*)\}/;
+					$attr = $1;
+					$cqueues = $2;
+				} else {
+					$cqueues = "";
+					$attr = $parms;
+				}
+			} else {
+				$attr = "";
+				$cqueus = "";
+			}
+			$qsess[$idx + 1] =~ /\[ pkts:.*?(\d+).*bytes:.*?(\d+).*dropped/;
+			$pkts = $1;
+			$bytes = $2;
+			push @q, "$qname|$iface|$bw|$pkts|$bytes|$attr|$cqueues";
+			
+		}
+	}
+	$ln = join "\n", @q;
+	print $connection $ln;
+}
+
+
+sub liverules {
+
+	open F, "/tmp/liverules";
+	@liverules = <F>;
+	close F;
+
+# @liverules = `/sbin/pfctl -vsr`;
+
+	for $idx (0..$#liverules) {
+		$_ = $liverules[$idx];
+		if(/^\S/) {
+			next if(/queue/);
+			if(/out/) {
+				/(.*) out.*/;
+				$action = $1;
+				if(/from (\S+) to (\S+)/) {
+					$from = $1;
+					$to = $2;
+				}
+				$intf = $1 if(/on (\w+)/);
+				$port = $1 if(/port = (\d+)/);
+				print "OUT: $action, $from, $to, $intf, $port\n";
+			} elsif(/in/) {
+				/(.*) in/;
+				$action = $1;
+				if(/from (\S+) to (\S+)/) {
+					$from = $1;
+					$to = $2;
+				}
+				$intf = $1 if(/on (\w+)/);
+				$port = $1 if(/port = (\d+)/);
+				print "IN: $action, $from, $to, $intf, $port\n";
+			}
+			$liverules[$idx + 1] =~ s/\s+/ /g;
+			$liverules[$idx + 1] =~ /Evaluations: (\d+) Packets: (\d+) Bytes: (\d+) States: (\d+)/;
+			$eval = $1;
+			$pkts = $2;
+			$bytes = $3;
+			$states = $4;
+			print "$eval,$pkts,$bytes,$states\n";	
+		}
+	}
+	$ln = join "\n", @r;
+	print $connection $ln;
+}
+
+sub urlfilt {
+	&findvals("urlfilt");
+	@urlfilt = @tokenvals;
+	# Now modify pf.conf
+	tie @filt, "Tie::File", "/etc/tinyproxy/filter.conf";
+	@filt = @urlfilt;
+	untie @filt;
+
+	system("/usr/bin/pkill -9 tinyproxy");
+	system("/usr/bin/sbin/tinyproxy");
+}
+
+sub caturlfilt {
+	&findvals("fullaccess_urlfilt");
+	@full = @tokenvals;
+	&findvals("restricted_urlfilt");
+	@rest = @tokenvals;
+	&findvals("custom1_urlfilt");
+	@cust1 = @tokenvals;
+	&findvals("custom2_urlfilt");
+	@cust2 = @tokenvals;
+	&findvals("custom3_urlfilt");
+	@cust3 = @tokenvals;
+	for $cat (qw(fullaccess restricted custom1 custom2 custom3)) {
+		tie @filt, "Tie::File", "/etc/tinyproxy/$cat/filter.conf";
+		if($cat =~ /full/) {
+			@filt = @full;
+		} elsif($cat=~ /rest/) {
+			@filt = @rest;
+		} elsif($cat=~ /custom1/) {
+			@filt = @cust1;
+		} elsif($cat=~ /custom2/) {
+			@filt = @cust2;
+		} elsif($cat=~ /custom3/) {
+			@filt = @cust3;
+		}
+
+		untie @filt;
+
+		($d, $pid) = split / /,`/bin/ps wax|grep $cat/tinyproxy|grep -v grep`;
+		system("/bin/kill -9 $pid");
+		system("/usr/bin/sbin/tinyproxy -c /etc/tinyproxy/$cat");
+	}
+}
+	
+sub showrelays {
+
+ 	@relays = `/usr/sbin/relayctl show summary`;
+
+	@sess = ();
+	@tmp = ();
+
+	for $idx (1..$#relays) {
+		$_ = $relays[$idx];
+		chomp();
+		s/\s+/ /g;
+		($id, $type) = split / /;
+		if($type =~ /relay/) {
+			push @sess, [@tmp] if($#tmp ne -1);
+			@tmp = ();
+			/relay (\w+) (\w+)$/;
+			$name = $1;
+			push @tmp, $name;
+		}
+		if($type =~ /table/) {
+			/table (\S+) (.*)$/;
+			$t = $1;
+			$t2 = $2;
+			($name, $port) = split /:/, $t;
+			$t2 =~ /(\w+).*\((\d) hosts\)/;
+			$status = $1;
+			$numhosts = $2;
+			push @tmp, $port;
+		}
+		if($type =~ /host/) {
+			($id,$d, $ip, $perc, $status) = split / /;
+			push @tmp, $ip, $perc, $status;
+		}
+
+	}
+	push @sess, [@tmp];
+
+	for(@sess) {
+		@a = @{$_};
+		$ln = join ",", @a;
+		push @out, $ln;
+	}
+
+	$ln = join "\n", @out;
+
+	print $connection $ln;
+
+}
+
+sub pfmonit {
+
+	@allrules = `/sbin/pfctl -vvsall`;
+
+	@rules = ();
+	@queues = ();
+	@states = ();
+	@generic = ();
+	@timeouts = ();
+	@limits = ();
+	@pftabs = ();
+
+	$sec = 0;
+	for $idx (0..$#allrules) {
+		$_ = $allrules[$idx];
+		chomp();
+
+		if(/^FILTER RULES:/) {
+			$sec = 1;
+			next;
+		} elsif(/^ALTQ:/) {
+			$sec = 2;
+			next;
+		} elsif(/^STATES:/) {
+			$sec = 3;
+			next;
+		} elsif(/^INFO:/) {
+			$sec = 4;
+			next;
+		} elsif(/^TIMEOUTS:/) {
+			$sec = 5;
+			next;
+		} elsif(/^LIMITS:/) {
+			$sec = 6;
+			next;
+		} elsif(/^TABLES:/) {
+			$sec = 7;
+			next;
+		} elsif(/^OS FINGERPRINTS:/) {
+			$sec = 8;
+			next;
+		}
+
+		if($sec eq 1) {
+			push @rules, $_;
+		} elsif($sec eq 2) {
+			push @queues, $_;
+		} elsif($sec eq 3) {
+			push @states, $_;
+		} elsif($sec eq 4) {
+			push @generic, $_;
+		} elsif($sec eq 5) {
+			push @timeouts, $_;
+		} elsif($sec eq 6) {
+			push @limits, $_;
+		} elsif($sec eq 7) {
+			push @pftabs, $_;
+		} 
+
+	}
+
+
+	for(@pftabs) {
+		s/\s+/ /g;
+		(@foo) = split / /;
+		push @tab, $foo[1];
+	}
+
+
+	for(@limits) {
+		s/\s+/ /g;
+#states        hard limit    10000
+#src-nodes     hard limit    10000
+#frags         hard limit     1536
+#tables        hard limit     1000
+#table-entries hard limit   200000
+		($item, $d, $d, $val) = split / /;
+		push @lim, "$item,$val";
+	}
+
+
+	for(@timeouts) {
+		s/\s+/ /g;
+#tcp.first                   120s
+#tcp.opening                  30s
+#tcp.established           86400s
+#tcp.closing                 900s
+#tcp.finwait                  45s
+#tcp.closed                   90s
+#tcp.tsdiff                   30s
+#udp.first                    60s
+#udp.single                   30s
+#udp.multiple                 60s
+#icmp.first                   20s
+#icmp.error                   10s
+#other.first                  60s
+#other.single                 30s
+#other.multiple               60s
+#frag                         30s
+#interval                     10s
+#adaptive.start             6000 states
+#adaptive.end              12000 states
+#src.track                     0s
+
+		($item, $val) = split / /;
+		push @tim, "$item,$val";
+
+
+	}
+
+
+	for $idx (0..$#states) {
+		$_ = $states[$idx];
+		s/\s+/ /g;
+
+		if(/(\S+) (\S+) (\S+) [<>]- (\S+) .*?(\S+)/) {
+			$from = $1;
+			$proto = $2;
+			$toipport = $3;
+			$fromipport = $4;
+			($toip, $tport) = split /:/, $toipport;
+			($fromip, $fport) = split /:/, $fromipport;
+			$st = $5;
+			if($proto =~ /tcp/) {
+				$states[$idx + 2] =~ /age.*?(\S+), expires in (\S+),.* (\d+):(\d+) pkts, (\d+):(\d+) bytes, rule (\d+)/;
+				$age = $1;
+				$expiry = $2;
+				$inpkt = $3;
+				$outpkt = $4;
+				$inbytes = $5;
+				$outbytes = $6;
+				$ruleid = $7;
+			} else {
+				$states[$idx + 1] =~ /age.*?(\S+), expires in (\S+),.* (\d+):(\d+) pkts, (\d+):(\d+) bytes, rule (\d+)/;
+				$age = $1;
+				$expiry = $2;
+				$inpkt = $3;
+				$outpkt = $4;
+				$inbytes = $5;
+				$outbytes = $6;
+				$ruleid = $7;
+			}
+			push @protost, "$fromip,$fport,$toip, $tport, $st, $proto, $from,"
+			 . "$age,$expiry,$inpkt,$outpkt,$inbytes,$outbytes,$ruleid";
+
+		}
+	}
+
+	for $idx (0..$#generic) {
+		$_ = $generic[$idx];
+		s/\s+/ /g;
+		if(/^Status: (\S+) for (.*)Debug/) {
+			$status = $1;
+			$dur = $2;
+		} elsif(/Bytes In/) {
+			($d, $d, $d, $bytesin) = split / /;
+		} elsif(/Bytes Out/) {
+			($d, $d, $d,$bytesout) = split / /;
+		} elsif(/Packets In/) {
+			$generic[$idx + 1] =~ /(\d+).*(\d+)$/;
+			$inpktspass =  $1;
+			$generic[$idx + 2] =~ /(\d+).*(\d+)$/;
+			$inpktsblocked = $1;
+		} elsif(/Packets Out/) {
+			$generic[$idx + 1] =~ /(\d+).*(\d+)$/;
+			$outpktspass =  $1;
+			$generic[$idx + 2] =~ /(\d+).*(\d+)$/;
+			$outpktsblocked = $1;
+		} elsif(/State Table/) {
+			$generic[$idx + 1] =~ s/\s+/ /g;
+			$generic[$idx + 2] =~ s/\s+/ /g;
+			$generic[$idx + 3] =~ s/\s+/ /g;
+			$generic[$idx + 4] =~ s/\s+/ /g;
+			($d, $d, $d, $states) = split / /, $generic[$idx + 1];
+			($d, $d, $stsearches) = split / /, $generic[$idx + 2];
+			($d, $d, $stinserts) = split / /, $generic[$idx + 3];
+			($d, $d, $stremovals) = split / /, $generic[$idx + 4];
+		} elsif(/match /) {
+			($d, $d, $matches, $matchrate) = split / /;
+		} elsif(/bad-offset/) {
+			($d, $d, $badoffset, $matchrate) = split / /;
+		} elsif(/fragment/) {
+			($d, $d, $frag, $matchrate) = split / /;
+		} elsif(/short/) {
+			($d, $d, $short, $matchrate) = split / /;
+		} elsif(/bad-timestamp/) {
+			($d,$d,  $badts, $matchrate) = split / /;
+		} elsif(/congestion/) {
+			($d, $d, $cong, $matchrate) = split / /;
+		} elsif(/ip-option/) {
+			($d,$d,  $ipopt, $matchrate) = split / /;
+		} elsif(/proto-cksum/) {
+			($d,$d,  $ckmismatch, $matchrate) = split / /;
+		} elsif(/state-mismatch/) {
+			($d,$d,  $stmismatch, $matchrate) = split / /;
+		} elsif(/state-insert/) {
+			($d,$d,  $stinsert, $matchrate) = split / /;
+		} elsif(/state-limit/) {
+			($d,$d,  $stlimit, $matchrate) = split / /;
+		} elsif(/src-limit/) {
+			($d,$d,  $srclimit, $matchrate) = split / /;
+		} elsif(/synproxy/) {
+			($d,$d,  $synproxy, $matchrate) = split / /;
+		} elsif(/max states per rule/) {
+			($d,$d,  $d, $d, $d, $maxstatesrule, $d) = split / /;
+		} elsif(/max-src-states/) {
+			($d,$d,  $maxsrcstates, $d) = split / /;
+		} elsif(/max-src-nodes/) {
+			($d,$d,  $maxsrcnodes, $d) = split / /;
+		} elsif(/max-src-conn /) {
+			($d,$d,  $maxsrcconn, $d) = split / /;
+		} elsif(/max-src-conn-rate/) {
+			($d,$d,  $maxsrcconnrate, $d) = split / /;
+		} elsif(/overload table insertion/) {
+			($d,$d,  $oldinserts, $oldinsertrate) = split / /;
+		} elsif(/overload flush states/) {
+			($d,$d,  $oldflush, $oldflushrate) = split / /;
+		}
+	}
+
+print $connection <<END_HTML;
+	<h1> PF firewall states and timers </h1>
+END_HTML
+
+
+print $connection <<END_HTML;
+<div class="sec">
+ <div class="header">PF firewall high level parameters </div>
+<FORM class="idealWrap inform" method=post action="cgi-bin/ifacesettings">
+<TABLE class='disp' id='macrotbl' BORDER=0>
+END_HTML
+
+print $connection "<tr> <td>Status</td><td> $status</td></tr>";
+print $connection "<tr> <td>Duration</td><td> $dur</td></tr>";
+print $connection "<tr> <td>Total bytes in</td><td> $bytesin</td></tr>";
+print $connection "<tr> <td>Total bytes out</td><td> $bytesout</td></tr>";
+print $connection "<tr> <td>IN pkts passed</td><td> $inpktspass</td></tr>";
+print $connection "<tr> <td>IN pkts blocked</td><td> $inpktblocked</td></tr>";
+print $connection "<tr> <td>OUT pkts passed</td><td> $outpktspass</td></tr>";
+print $connection "<tr> <td>OUT pkts blocked</td><td> $outpktblocked</td></tr>";
+print $connection "<tr> <td>Total states</td><td> $states</td></tr>";
+print $connection "<tr> <td>Total state searches </td><td> $stsearches</td></tr>";
+print $connection "<tr> <td>Total state inserts</td><td> $stinserts</td></tr>";
+print $connection "<tr> <td>Total state removals</td><td> $stremovals</td></tr>";
+print $connection "<tr> <td>Total state matches</td><td> $matches</td></tr>";
+print $connection "<tr> <td>Bad offsets</td><td> $badoffset</td></tr>";
+print $connection "<tr> <td>Fragments</td><td> $frag</td></tr>";
+print $connection "<tr> <td>Short packets</td><td> $short</td></tr>";
+print $connection "<tr> <td>Bad timestamps</td><td> $badts</td></tr>";
+print $connection "<tr> <td>Congestion</td><td> $cong</td></tr>";
+print $connection "<tr> <td>Packets with IP options</td><td> $ipopt</td></tr>";
+print $connection "<tr> <td>Packets with cksum mismatch</td><td> $ckmismatch</td></tr>";
+print $connection "<tr> <td>Maximum states per rule </td><td> $maxstatesrule</td></tr>";
+print $connection "<tr> <td>Maximum states per source IP </td><td> $maxsrcstates</td></tr>";
+print $connection "<tr> <td>Maximum source IP nodes </td><td> $maxsrcnodes</td></tr>";
+print $connection "<tr> <td>Maximum source IP connections </td><td> $maxsrcconn</td></tr>";
+print $connection "<tr> <td>Maximum source IP connection rate</td><td> $maxsrcconnrate</td></tr>";
+print $connection <<END_HTML;
+	</table>
+	</form>
+	</div>
+END_HTML
+
+print $connection <<END_HTML;
+<div class="sec">
+ <div class="header">PF firewall timers </div>
+<FORM class="idealWrap inform" method=post action="cgi-bin/ifacesettings">
+<TABLE class='disp' id='macrotbl' BORDER=0>
+END_HTML
+for(@tim) {
+	($parm, $val) = split /,/;
+	print $connection "<tr> <td>$parm</td><td>$val</td></tr>";
+}
+print $connection <<END_HTML;
+	</table>
+	</form>
+	</div>
+END_HTML
+
+print $connection <<END_HTML;
+<div class="sec">
+ <div class="header">PF firewall limits </div>
+<FORM class="idealWrap inform" method=post action="cgi-bin/ifacesettings">
+<TABLE class='disp' id='macrotbl' BORDER=0>
+END_HTML
+for(@lim) {
+	($parm, $val) = split /,/;
+	print $connection "<tr> <td>$parm</td><td>$val</td></tr>";
+}
+print $connection <<END_HTML;
+	</table>
+	</form>
+	</div>
+END_HTML
+
+print $connection <<END_HTML;
+<div class="sec">
+ <div class="header">PF protocol states </div>
+<FORM class="idealWrap inform" method=post action="cgi-bin/ifacesettings">
+<TABLE class='disp' id='macrotbl' BORDER=0>
+END_HTML
+# $fromip,$fport,$toip, $tport, $st, $proto, $from,$age,$expiry,$inpkt,$outpkt,$inbytes,$outbytes,$ruleid";
+
+print $connection <<END_HTML;
+	<tr>
+		<th> From IP </th>
+		<th> From port </th>
+		<th> To IP </th>
+		<th> To port </th>
+		<th> State </th>
+		<th> Protocol </th>
+		<th> Age </th>
+		<th> Expiry </th>
+		<th> IN pkt </th>
+		<th> IN bytes </th>
+		<th> OUT pkt </th>
+		<th> OUT bytes </th>
+		<th> Rule No</th>
+	</tr>
+END_HTML
+
+for(@protost) {
+	($fromip,$fport,$toip, $tport, $st, $proto, $ign,$age,
+	$expiry,$inpkt,$outpkt,$inbytes,$outbytes,$ruleid) = split /,/;
+	print $connection "<tr>";
+	print $connection <<END_HTML;
+		<td>$fromip</td><td>$fport</td>
+		<td>$toip</td><td>$tport</td>
+		<td>$st</td><td>$proto</td>
+		<td>$age</td><td>$expiry</td>
+		<td>$inpkt</td><td>$inbytes</td>
+		<td>$outpkt</td><td>$outbytes</td>
+		<td>$ruleid</td>
+END_HTML
+	print $connection "</tr>";
+}
+print $connection <<END_HTML;
+	</table>
+	</form>
+	</div>
+END_HTML
+
+
+
+}
+
+sub snortrules {
+	&findvals("snort_rules");
+	@snortrules = @tokenvals;
+	@insertrules = ();
+	for(@snortrules) {
+		($proto, $fromip, $fromport, $toip, $toport, $dir, $action) = split / /;
+		$dir = "->" if ($dir =~ /directional/);
+		$dir = "<>" if($dir =~ /both/);
+		push @insertrules, "$action $proto $fromip $fromport $dir $toip $toport";
+	}
+	
+	tie @snortconfig, "Tie::File", "/etc/snort/rules";
+	for(@snortconfig) {
+	}
+	push @snortconfig, @insertrules;
+	untie @snortconfig;
+
+}
+
+sub snortout {
+	$localnet = `grep ^localnet /etc/fw.conf|cut -d' ' -f2`;
+	chomp($localnet);
+	system("rm /var/log/snort/out*");
+	system("/usr/local/bin/snort -b --daq-dir /usr/local/lib/daq -e -h $localnet -n 25 -L /var/log/snort/out.dump 2>&1");
+	@lines = readpipe "/usr/local/bin/snort --daq-dir /usr/local/lib/daq -r /var/log/snort/out.dump* 2>&1";
+	$ln = join "\n", @lines;
+	print $connection $ln;
+
+}
+
+# XXX Monitoring
+sub show_bwmonng {
+	@lines = `/usr/local/bin/bwm-ng -o plain -c 1`;
+	print $connection @lines;
+}
+
+sub show_ifstat {
+	@lines = `/usr/local/bin/ifstat -b 1 10`;
+	print $connection @lines;
+}
+
+sub show_pktstat {
+	@lines = `/usr/local/bin/pktstat -FB1 -w1`;
+	print $connection @lines;
+}
+
+sub show_netstat {
+	@lines = `/usr/bin/netstat -b -c 1 -w 1`;
+	print $connection @lines;
+}
+
+sub show_raw_pkt {
+	@lines = `/usr/sbin/tcpdump -tt -qnIo -c 5`;
+	print $connection @lines;
+}
+
+sub reb {
+	$inprogress = `/usr/bin/pgrep tar`;
+	chomp($inprogress);
+	while(1) {
+		unless($inprogress =~ /\d/) {
+			exec("/sbin/reboot");
+		}
+		sleep(2);
+	}
+}
+
+sub shut {
+	$inprogress = `/usr/bin/pgrep tar`;
+	chomp($inprogress);
+	while(1) {
+		unless($inprogress =~ /\d/) {
+			exec("/sbin/halt -qp");
+		}
+		sleep(2);
+	}
+}
+
+sub getipmask {
+	($intf) = $_[0];
+	open F, "/etc/hostname.$intf";
+	@ipf = <F>;
+	close F;
+
+	for(@ipf) {
+		if(/inet/ and !/alias/) {
+			s/\s+/ /g;
+			($d, $ip, $mask) = split / /;
+		}
+	}
+	$line = join "\n", $ip, $mask;
+	print $connection $line;
+}
+
+sub set_tz {
+ 	`/bin/rm /etc/localtime 2>/dev/null`;
+        `ln -s /usr/share/zoneinfo/@_ /etc/localtime`;
+}
+
+#------------------------------Firewall--------------------------#
+sub macfilt {
+
+	$enablemac = `grep ^macfilter /etc/fw.conf|cut -d' ' -f2`;
+	chomp($enablemac);
+	@macrules = ();
+	if($enablemac =~ /yes/) {
+		@brules = ();
+		&findvals("macaddr");
+		@allowedmac = @tokenvals;
+		for(@allowedmac) {
+			($mac, $label) = split / /;
+			 `/sbin/ifconfig bridge0 rule pass in on egress src $mac tag $label`;
+			push @macrules, "pass in on egress tagged $label";
+		}
+	}
+
+# Now modify pf.conf
+	tie @pf, "Tie::File", "/etc/pf.conf";
+	$idx = $#pf;
+	$secctionflag = 0;
+	for $var (0 .. $idx) {
+		$_ = $pf[$var];
+		chomp();
+
+		if(/EndMacFilt/ and ($sectionflag eq 1)) {
+			splice (@pf, $off, $cnt, @macrules);
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_ . "\n";
+			next;
+		}
+
+		if(/^StartMacFilt/) {
+			$off = $var + 1;
+			$sectionflag = 1;
+
+		}
+	}
+	untie @pf;
+
+	`/sbin/pfctl -f /etc/pf.conf`;
+}
+
+sub portfwd {
+	@fwdrules = ();
+	&findvals("port_fwd");
+	for(@tokenvals) {
+		($pubip, $pubport, $localip, $localport, $proto) = split / /;
+		push @fwdrules, "pass in on egress inet proto $proto from $pubip port $pubport to egress rdr-to $localip port $localport";
+	}
+	# Now modify pf.conf
+	tie @pf, "Tie::File", "/etc/pf.conf";
+	$idx = $#pf;
+	$secctionflag = 0;
+	for $var (0 .. $idx) {
+		$_ = $pf[$var];
+		chomp();
+
+		if(/EndPortFwd/ and ($sectionflag eq 1)) {
+			splice (@pf, $off, $cnt, @fwdrules);
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_ . "\n";
+			next;
+		}
+
+		if(/^StartPortFwd/) {
+			$off = $var + 1;
+			$sectionflag = 1;
+
+		}
+	}
+	untie @pf;
+	`/sbin/pfctl -f /etc/pf.conf`;
+}
+
+sub pf_setnat {
+	($natip) = $_[0];
+
+	tie @pf, "Tie::File", "/etc/pf.conf" or 
+		die "Could not open file for writing";
+	for(@pf) {
+		if(/natip=/) {
+			$_ = $natip;
+			last;
+		}
+	}
+	untie @pf;
+	system("/sbin/pfctl -f /etc/pf.conf");
+}
+
+sub urlfilt_localnet_set {
+	($localnets) = $_[0];
+	@localnets = split /,/, $localnets;
+	tie @tp, "Tie::File", 
+	"/etc/tinyproxy/tinyproxy.conf";
+	@tp = grep(!/^Allow/, @tp);
+	for(@localnets) {
+		push @tp, "Allow $_";
+	}
+	untie @tp;
+	
+}
+
+sub urlfiltlist {
+	@urls = ();
+	tie @filter, "Tie::File", 
+	"/etc/tinyproxy/filter", mode => O_RDONLY; 
+	@urls = @filter;
+	untie @filter;
+	$line = join "\n", @urls;
+	print $connection  $line;
+
+}
+
+sub nat_enable {
+	tie @pf, "Tie::File", "/etc/pf.conf";
+	for(@pf) {
+		if(/out/ and !/nat-to/) {
+			$_ .= " nat-to \$natip";
+		}
+	}
+	untie @pf;
+	`/sbin/pfctl -f /etc/pf.conf`;
+}
+sub nat_disable {
+	tie @pf, "Tie::File", "/etc/pf.conf";
+	for(@pf) {
+		if(/out/) {
+			s/nat-to \$natip//;
+		}
+	}
+	untie @pf;
+	`/sbin/pfctl -f /etc/pf.conf`;
+}
+
+sub cat_urllist {
+	($cat) = $_[0];
+	@urls = ();
+	tie @filter, "Tie::File", 
+	"/etc/tinyproxy/$cat/filter", mode => O_RDONLY or 
+		die "Could not open file for reading";
+	@urls = @filter;
+	untie @filter;
+	$line = join "\n", @urls;
+	print $connection  $line;
+
+}
+
+sub cat_urladd {
+	($cat,$url) = @_;
+	tie @filter, "Tie::File", 
+	"/etc/tinyproxy/$cat/filter" or 
+		syslog(LOG_ERR, "Could not open file for reading");
+		
+	push @filter, $url;
+	untie @filter;
+	($d, $pid) = split / /,`/bin/ps wax|grep $cat/tinyproxy|grep -v grep`;
+	system("/bin/kill -9 $pid");
+	system("/usr/bin/sbin/tinyproxy -c /etc/tinyproxy/$cat");
+
+}
+
+sub cat_urldel {
+	($cat, @delurls) = split /\n/, $_[0];
+	tie @filter, "Tie::File", 
+	"/etc/tinyproxy/$cat/filter" or 
+		syslog(LOG_ERR, "Could not open file for writing");
+	$diff = Array::Diff->diff(\@filter, \@delurls);
+	@filter = @{$diff->deleted};
+	syslog(LOG_INFO, "New filter [@filter");
+	untie @filter;
+	($d, $pid) = split / /,`/bin/ps wax|grep $cat/tinyproxy|grep -v grep`;
+	system("/bin/kill -9 $pid");
+	system("/usr/bin/sbin/tinyproxy -c /etc/tinyproxy/$cat");
+
+}
+
+sub restipsec {
+	system("/usr/bin/pkill -9 isakmpd");
+	system("/sbin/isakmpd -K");
+	system("/sbin/ipsecctl -F");
+	system("/sbin/ipsecctl -f /etc/ipsec.conf");
+}
+
+sub getdefroutes {
+	@r = `/usr/bin/netstat -rn -f inet|grep default`;
+	@gateways = ();
+	for(@r) {
+		s/\s+/ /g;
+		@f = split / /;
+		$gwy = $f[1];
+		$iface = $f[7];
+		push @gateways, $gwy . "," . $iface;
+	}
+	$ln = join "\n", @gateways;
+	syslog(LOG_INFO, " Writing gateway line [$ln]");
+	print $connection $ln;
+}
+
+
+sub addroute {
+	($net, $dest) = split / /,$_[0];
+	$net =~ s/\s//g;
+	system("/sbin/route add $net $dest");
+	system("/sbin/route add -net $net $dest");
+}
+sub delroute {
+	$_[0] =~ s/\s+/ /g;
+	($dest) = $_[0];
+	system("/sbin/route delete $dest");
+
+}
+
+sub movelicense {
+        $f = '/var/www/htdocs/upload/license.img';
+        ($out) = readpipe "openssl aes-256-cbc -d -k saraswathy1729 -in $f";
+        if($out =~ /License/) {
+                move($f, '/etc/license.img');
+                # Reset license begin time
+                ($file) = </etc/hostname.*>;
+                `touch $file`;
+                syslog("info", "License imported successfully!");
+                print $connection "SUCCESS";
+        } else {
+                syslog(LOG_ERR, "License file corrupt!");
+                print $connection "FAILURE";
+        }
+
+}
+
+sub moveurl {
+	$f = bsd_glob('/var/www/htdocs/upload/*');
+	move($f, '/etc/tinyproxy/filter');
+
+	open F, "/etc/tinyproxy/filter";
+	@cont = <F>;
+	close F;
+	tie @fw, "Tie::File", "/etc/fw.conf";
+
+	$idx = $#fw - 1;
+	$cnt = 0;
+	$sectionflag = 0;
+	for $var (0 .. $idx) {
+		$_ = $fw[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag eq 1)) {
+			if($tok =~ /urlfilt/) {
+				splice @fw, $off, $cnt, @cont;
+			}
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_ . "\n"; 
+			next;
+		}
+		
+		if(/^urlfilt/) {
+			$tok = $&;
+			$off = $var + 1;
+			$sectionflag = 1;
+		}
+	}
+	untie @fw;
+	`/usr/bin/pkill -9 tinyproxy ; /usr/local/sbin/tinyproxy`;
+}
+
+sub movemac {
+	$f = bsd_glob('/var/www/htdocs/upload/*');
+	move($f, '/tmp/macaddr.txt');
+	tie @macs, "Tie::File", "/tmp/macaddr.txt";
+	tie @fw, "Tie::File", "/etc/fw.conf";
+	$idx = $#fw;
+
+	for $var (0 .. $idx) {
+		$_ = $fw[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag eq 1)) {
+                                if($tok eq "macaddr") {
+                                        splice @fw, $off, $cnt, @macs;
+                                        last;
+                                }
+                                next;
+                        }
+
+		if($sectionflag eq 1) {
+			$cnt++;
+		}
+                        if(/^macaddr/) {
+                                $tok = $&; 
+                                $off = $var + 1;
+                                $sectionflag = 1;
+
+                        }
+            }
+	untie @fw;
+	unlink("/tmp/macaddr.txt");
+}
+
+sub setdyndns {
+	($dns, $key) = @_;
+	$dns =~ s/\s//g;
+	$key =~ s/\s//g;
+	if($dns =~ /DISABLE/) {
+		system("/bin/chmod ugo-x /bin/ipupdate");
+	} else {
+		tie @ipupdate, "Tie::File", "/bin/ipupdate";
+		for(@ipupdate) {
+			if(/curl/) {
+				($d, $url) = split / /;
+				$url =~ /\@(.*)=/;
+				$url = "http://$dns:$key\@$1=$dns";
+				$_ = "/usr/local/bin/curl $url";
+				last;
+			}
+		}
+	untie @ipupdate;
+		system("/bin/chmod ugo+x /bin/ipupdate");
+	}
+}
+
+sub setmyhostname {
+	($myname) = $_[0];
+	tie @my, "Tie::File", "/etc/myname";
+	@my = "$myname";
+	untie @my;
+}
+
+sub setournet {
+	($ournet) = $_[0];
+	tie @ipsec, "Tie::File", "/etc/ipsec.conf";
+	for(@ipsec) {
+		if(/^localnet/) {
+			$_ = "localnet=\"$ournet\"";
+		}
+	}
+	untie @ipsec;
+}
+
+#------------------------------Functions--------------------------#
+sub dispatch {
+	($msg, @args) = @_;
+
+	$arg = join " ", @args;
+	chomp($arg);
+	chop($arg);
+	$_ = $msg;
+	s/\.//g;
+
+	syslog(LOG_INFO, " Message is  $_ and arg are $arg");
+	# XXX This place contains the master list of Commands
+	if(/^REBOOT$/) {
+		syslog(LOG_INFO, "I get a REBOOT message with arg $arg");
+		&reb;
+	} elsif(/^SHUTDOWN$/) {
+		syslog(LOG_INFO, "I get a SHUTDOWN message with arg $arg");
+		&shut;
+	} elsif(/^GETIPMASK$/) {
+		syslog(LOG_INFO, "I get a GETIPMASK message with arg $arg");
+		&getipmask($arg);
+	} elsif(/^SET_TZ$/) {
+		syslog(LOG_INFO, "I get a SET_TZ message with arg $arg");
+		&set_tz($arg);
+# XXX VPNBee stuff
+	} elsif(/^MONITCTL$/) {
+		syslog(LOG_INFO, "I get a MONITCTL with arg $arg");
+		&monitctl($arg);
+	} elsif(/^MONITGLOBAL$/) {
+		syslog(LOG_INFO, "I get a MONITGLOBAL with arg $arg");
+		&monitglobal($arg);
+	} elsif(/^MONITDAEMONS$/) {
+		syslog(LOG_INFO, "I get a MONITDAEMONS with arg $arg");
+		&monitdaemons($arg);
+	} elsif(/^MONITSYSTEM$/) {
+		syslog(LOG_INFO, "I get a MONITSYSTEM with arg $arg");
+		&monitsystem($arg);
+	} elsif(/^PINGHOST$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&pinghost($arg);
+	} elsif(/^TRACEHOST$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&tracehost($arg);
+	} elsif(/^BING$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&bing($arg);
+	} elsif(/^SING$/) {
+		syslog(LOG_INFO, "I get a $&  message with args $arg");
+		&sing($arg);
+	} elsif(/^HPING$/) {
+		syslog(LOG_INFO, "I get a $&  message with args $arg");
+		&hping($arg);
+	} elsif(/^NMAP$/) {
+		syslog(LOG_INFO, "I get a $&  message with args $arg");
+		&nmap($arg);
+	} elsif(/^DHCPIMPORT$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&dhcpimport;
+	} elsif(/^APPLYLOGO$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&applylogo;
+	} elsif(/^SETUPSSHVPN$/) {
+		syslog(LOG_INFO, "I get a SETUPSSHVPN message with args $arg");
+		&setupsshvpn($arg);
+	} elsif(/^OVPNTUNDEL$/) {
+		syslog(LOG_INFO, "I get a OVPNTUNDEL message with args $arg");
+		&ovpntundel($arg);
+	} elsif(/^USERBW_SESSIONS$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&userbw_sessions($arg);
+	} elsif(/^OPENVPN_SERVPARMS$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&openvpn_servparams;
+	} elsif(/^PPTPL2TP_SET$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&pptpl2tp_set($arg);
+	} elsif(/^PPTPL2TP_SESSIONS$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&pptpl2tp_sessions($arg);
+	} elsif(/^LISTVPNTUNS$/) {
+		syslog(LOG_INFO, "I get a LISTVPNTUNS message with args $arg");
+		&listvpntuns($arg);
+	} elsif(/^LISTOPENVPNTUNS$/) {
+		syslog(LOG_INFO, "I get a LISTOPENVPNTUNS message with args $arg");
+		&listopenvpntuns($arg);
+	} elsif(/^LISTSSHTUNS$/) {
+		syslog(LOG_INFO, "I get a LISTSSHTUNS message with args $arg");
+		&listsshtuns($arg);
+	} elsif(/^SET_IP$/) {
+		syslog(LOG_INFO, "I get a SET_IP message with args $arg");
+		&set_ip($arg);
+	} elsif(/^ADDMPATH$/) {
+		syslog(LOG_INFO, "I get a ADDMPATH message with args $arg");
+		&addmpath($arg);
+	} elsif(/^GETDEFROUTES$/) {
+		syslog(LOG_INFO, "I get a GETDEFROUTES message with args $arg");
+		&getdefroutes;
+	} elsif(/^ADDROUTE$/) {
+		syslog(LOG_INFO, "I get a ADDROUTE message with args $arg");
+		&addroute($arg);
+	} elsif(/^DELROUTE$/) {
+		syslog(LOG_INFO, "I get a DELROUTE message with args $arg");
+		&delroute($arg);
+	} elsif(/^PARSEPF$/) {
+		syslog(LOG_INFO, "I get a PARSEPF message with args $arg");
+		&parsepf($arg);
+	} elsif(/^MOVELICENSE$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&movelicense;
+	} elsif(/^MOVEURL$/) {
+		syslog(LOG_INFO, "I get a MOVEURL message with args $arg");
+		&moveurl;
+	} elsif(/^MOVEMAC$/) {
+		syslog(LOG_INFO, "I get a MOVEURL message with args $arg");
+		&movemac;
+	} elsif(/^MOVENETBL$/) {
+		syslog(LOG_INFO, "I get a MOVENETBL message with args $arg");
+		&movenetbl;
+	} elsif(/^RESTIPSEC$/) {
+		syslog(LOG_INFO, "I get a RESTIPSEC message with args $arg");
+		&restipsec;
+	} elsif(/^LISTIPSECSESSIONS$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&listipsecsessions;
+	} elsif(/^PORTFWD$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&portfwd;
+	} elsif(/^MACFILT$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&macfilt;
+	} elsif(/^SETOURNET$/) {
+		syslog(LOG_INFO, "I get a SETOURNET message with arg $arg");
+		&setournet($arg);
+	} elsif(/^SAVENWCONFIG$/) {
+		syslog(LOG_INFO, "I get a SAVENWCONFIG message with arg $arg");
+		&savenwconfig($arg);
+	} elsif(/^DHCPCONFIG$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&dhcpconfig;
+	} elsif(/^SAVEVAR$/) {
+		syslog(LOG_INFO, "I get a SAVEVAR message with args $arg");
+		&savevar;
+	} elsif(/^SHOW_FILT_TCPDUMP$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg"); 
+		&show_filt_tcpdump($arg);
+	} elsif(/^SHOW_TCPDUMP$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg"); 
+		&show_tcpdump;
+	} elsif(/^SETRELAYD$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg"); 
+		&setrelayd;
+	} elsif(/^START_DLTEST$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&start_dltest;
+	} elsif(/^START_UPLTEST$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&start_upltest;
+	} elsif(/^SHOW_BWMONNG$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&show_bwmonng;
+	} elsif(/^SCOURLOG$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&scourlog;
+	} elsif(/^QOS$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&qos;
+	} elsif(/^URLFILT$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&urlfilt;
+	} elsif(/^CATURLFILT$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&caturlfilt;
+	} elsif(/^FWRULES$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&fwrules;
+	} elsif(/^QSESS$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&qsess;
+	} elsif(/^LIVERULES$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&liverules;
+	} elsif(/^SHOWRELAYS$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&showrelays;
+	} elsif(/^SNORTRULES$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&snortrules;
+	} elsif(/^SNORTOUT$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&snortout;
+	} elsif(/^PFMONIT$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&pfmonit;
+	} elsif(/^VLANBRIDGETRUNK$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&vlanbridgetrunk;
+	} elsif(/^TRUNKBUNDLE$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&trunkbundle;
+	} elsif(/^INSTALLVPN$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&installvpn;
+	} elsif(/^ADDRXLATe$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&addrxlate;
+	} elsif(/^GROUPSETTINGS$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&groupsettings;
+	} elsif(/^IPSECVPN$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&ipsecvpn;
+	} elsif(/^OPENVPN$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&openvpn;
+	} elsif(/^CAPTIVESETUP$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&captivesetup;
+	} elsif(/^USERBWCONTROL$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&userbwcontrol;
+	 # XXX Monitoring stuff
+	} elsif(/^SHOW_IFSTAT$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&show_ifstat;
+	} elsif(/^SHOW_NETSTAT$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&show_netstat;
+	} elsif(/^SHOW_PKTSTAT$/) {
+		syslog(LOG_INFO, "I get a SHOW_PKTSTAT message with arg $arg");
+		&show_pktstat;
+	} elsif(/^SHOW_RAW_PKT$/) {
+		syslog(LOG_INFO, "I get a SHOW_RAW_PKT message with arg $arg"); 
+		&show_raw_pkt;
+	} else {
+		syslog(LOG_ERR, " I get a garbled message : [@_]");
+	}
+	$connection->flush;
+	close($connection);
+}
+
+MAIN:
+{
+   # Daemonize
+   Proc::Daemon::Init();
+   $SIG{CHLD} = \&REAPER;
+   # Perform initializes here
+	openlog("Broker-Daemon", "ndelay,pid", "local0");
+	syslog(LOG_INFO, " Opening UNIX socket...");
+	unlink $socketfile;
+ 	my $server = IO::Socket::UNIX->new(Local => $socketfile,
+                                    Type      => SOCK_STREAM,
+                                    Listen    => 32 ) or die $!;
+	chmod 0766, $socketfile;
+   # Enter loop to do work
+	syslog(LOG_INFO, " I am listening now...");
+	for(;;) {
+		$connection = $server->accept();
+		$pid = fork();
+		if($pid) {
+			close($connection);
+			next;
+			# Go back to accept
+		} else {
+			my @lines = ();
+			while($data= <$connection>) {
+				push @lines, $data;
+				if($data =~ /\.\n/) {
+					last;
+				}
+			}
+			if($lines[0] =~ /\w/) {
+				system("/sbin/mount -o rw /");
+				&dispatch(@lines);
+				system("/bin/rm /ramdisk/etc.tar.gz");
+				system("/bin/tar zcpf /ramdisk/etc.tar.gz /etc");
+				system("/sbin/mount -o ro /");
+			}
+			exit(0);
+		}
+	}
+}

@@ -1,0 +1,2315 @@
+#!/usr/bin/perl 
+
+$|++;
+use IO::Socket;
+use Mail::Box::Manager;
+use FileHandle;
+use IPC::Open2;
+use File::HomeDir;
+use Proc::Daemon;
+use Tie::File;
+use Digest::SHA1 qw(sha1_hex);
+use DBI;
+use Sys::Syslog;
+use POSIX;
+use File::Copy;
+use Digest::SHA1 qw(sha1_hex);
+use File::Glob ':glob';
+
+sub REAPER {
+	my $child;
+# If a second child dies while in the signal handler caused by the
+# first death, we won't get another signal. So must loop here else
+# we will leave the unreaped child as a zombie. And the next time
+# two children die we get another zombie. And so on.
+	while (($child = waitpid(-1,WNOHANG)) > 0) {
+		$Kid_Status{$child} = $?;
+	}
+	$SIG{CHLD} = \&REAPER;  # still loathe SysV
+}
+
+# XXX Global settings
+
+my $socketfile = "/tmp/unixsock";
+
+
+#------- XXX  Utility Functions--------------------------#
+
+
+sub findvals {
+	($token) = @_;
+	tie @mp, "Tie::File", "/etc/mp.conf", mode => O_RDONLY or 
+		die "Could not open file for reading";
+	$idx = $#mp - 1;
+	$cnt = 0;
+	$sectionflag = 0;
+	@values = ();
+	for $var (0 .. $idx) {
+		$_ = $mp[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag  eq 1)) {
+			@tokenvals = @values;
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			$cnt++;
+			push @values, $_;
+			next;
+		}
+		if(/^$token/) {
+			$tok = $&;
+			$sectionflag = 1;
+		}
+	}
+	untie @mp;
+}
+
+
+sub mailbotrules {
+	tie @mp, "Tie::File", "/etc/mp.conf", mode => O_RDONLY or 
+		die "Could not open file for reading";
+
+	$idx = $#mp - 1;
+	$cnt = 0;
+	$sectionflag = 0, $txtflag = 0;
+	for $var (0 .. $idx) {
+		$_ = $mp[$var];
+		chomp();
+
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag eq 1)) {
+			@tokenvals = @values;
+			last;
+		}
+
+		if($sectionflag eq 1) {
+			if(/^\]\]/) {
+				$msg = join "\n", @txt;
+				push @values, "$saved,$msg";
+				$txtflag = 0;
+				@txt = ();
+				next;
+			}
+			if($txtflag eq 1) {
+				push @txt, $_;
+				next;
+			}
+			if(/^\[\[/) {
+				$txtflag = 1;
+				next;
+			}
+			$saved =  $_;
+			next;
+		}
+		if(/^mailbot_rules/) {
+			$tok = $&;
+			$sectionflag = 1;
+		}
+	}
+	untie @mp;
+}
+
+#------- XXX  Real Functions--------------------------#
+
+sub mailbot {
+
+	&mailbotrules;
+
+		for(@tokenvals) {
+			($login, $rule, $match, $cmd) = split /:/;
+
+			$home = File::HomeDir->users_home($login);
+			open F, ">$home/.forward";
+			print F "| /usr/local/bin/maildrop";
+			close F;
+
+			`chown $login $home/.forward`;
+			chmod(0755, "$home/.forward");
+
+			open F, ">$home/.mailfilter";
+			print F <<END;
+# Test
+
+			if (/^Subject: .*help/) 
+			{
+				cc "| mailbot -t /var/www/cgi-bin/mp/template/out.txt -A 'precedence: bulk' \\
+					/usr/sbin/sendmail -t \$RECIPIENT"
+			}
+
+			if(/^Subject: .*mailarchive.html/) 
+			{
+				`cp /etc/ntpd.conf /tmp/foo.txt`
+					` mutt -s 'Mail archive HTML' -a /tmp/foo.txt -- \$FROM < /var/www/cgi-bin/mp/template/reply.txt`
+					`rm /tmp/foo.txt`
+			}
+
+END
+			`chown $login $home/.mailfilter`;
+			chmod(0600, "$home/.mailfilter");
+		}
+
+}
+
+sub savenwconfig {
+
+($intf_value, $ipaddrtext, $masktext, $gatewaytext) = split /\n/, $_[0];
+
+
+	chomp($intf_value);
+	chomp($ipaddrtext);
+	chomp($masktext);
+	chomp($gatewaytext);
+	system("/sbin/ifconfig $intf_value $ipaddrtext netmask $masktext");
+	`/sbin/pfctl -Fa -ef /etc/pf.conf >/dev/null 2>&1`;
+	system("/sbin/route delete default 2>/dev/null 1>&2");
+	$ret = system("/sbin/route add default -host $gatewaytext");
+
+	open IP, ">/etc/hostname.$intf_value";
+	print IP "inet $ipaddrtext $masktext\n";
+	close IP;
+
+	open GWY, ">/etc/mygate";
+	print GWY "$gatewaytext\n";
+	close GWY;
+
+	`/bin/chmod 0640 /etc/hostname.$intf_value `;
+	print $connection "SUCCESS";
+ 
+}
+
+sub senderr {
+	$errstring = $_[0];
+	syslog(LOG_ERR, "ERROR" . $errstring);
+	print $connection "ERROR" ."\n" . $errstring;
+}
+
+sub mailwebproto {
+        ($http, $https) = split /\n/, $_[0];
+        if($https eq "on") {
+                system("pkill httpd");
+                system("/usr/sbin/httpd -DSSL -u");
+        }
+
+}
+
+sub readmbox {
+	$login = @_;
+	$mb = File::HomeDir->users_home($login);
+	my $mgr = Mail::Box::Manager->new(folder =>"$mb/Maildir", save_on_exit => 1);
+	my $folder = $mgr->open(save_on_exit => 1);
+
+	$num = $folder->messages;
+	for($folder->messages) {
+		$header = $_->head;
+
+		$sender = $_->sender();
+		@to = $_->to();
+		for $addr (@to) {
+			push @toid, $addr->format;
+		}
+		@bcc = $_->bcc();
+		for $addr (@bcc) {
+			push @bccid, $addr->format;
+		}
+		@cc = $_->cc();
+		for $addr (@cc) {
+			push @ccid, $addr->format;
+		}
+		$sub = $_->subject();
+		@dest = $_->destinations();
+		for $addr (@dest) {
+			push @destid, $addr->format;
+		}
+		$date = $_->timestamp();
+
+		$size = $_->size();
+		$msgid = $_->messageId();
+		$mimetype = $_->contentType();
+		@foo = map { (a..z,0..9)[rand(36)] } 0..10;
+		$attfolder = join '', @foo;
+		$mailbody = "/tmp/mailbody.txt";
+		open O, "> $mailbody";
+		print O $_->decoded;
+		close(O);
+		chdir '/tmp';
+		$pid = getpid();
+		open T, "> /tmp/.archive.$pid";
+		$_->print(\*T);
+		close(T);
+		unlink </tmp/.archive*>;
+		unlink </tmp/part*>;
+			      @attach = `/usr/local/bin/munpack -ft /tmp/.archive.$pid`;
+			      @mailattach = ();
+			      for(@attach) {
+			      	($file, $mime) = split / /;
+			      	next if (/part/);
+			      	push @mailattach, "$attfolder/$file";
+			      }
+
+			      unlink("/tmp/.archive.$pid");
+			      chdir($ENV{HOME});
+			      $numatt = $#mailattach + 1;
+			      $attlist = join "|", @mailattach;
+			      $recdline = $_->get('Received');
+			      $recdline =~ /\[(.*)\]/;
+			      $envip = $1;
+			      next if(!defined($sender));
+			      syslog('info',"RecdIP:" . $envip  . "");
+			      syslog('info',"Sender:" .  $sender->format . "");
+			      syslog('info',"To: @toid  ");
+			      syslog('info',"msgid: $msgid  ");
+			      syslog('info',"Dest: @destid ");
+			      syslog('info',"Sub:" . $sub  . ""); 
+			      $ts = `date -r $date`;
+			      $ourtime = time;
+			      syslog('info',"Date: " . $ts . "");
+			      syslog('info',"Size: " . $_->size() . "");
+			      syslog('info',"Bcc:  @bccid ");
+			      syslog('info',"Cc:   @ccid ");
+			      syslog('info',"MIME:" . $mime . "");
+			      if($mime eq "text/plain") {
+			      open O, ">$mailbody";
+			      print O $_->decoded;
+			      close(O);
+			      }
+			      syslog('info', "Numattach: $numatt");
+			      if($attlist =~ /\w/) {
+			      syslog('info',"Attach list: [$attlist]");
+			      }
+			      $fromid = $sender->format;
+			      $toid = join ',', @toid;
+			      $ccid = join ',', @destid;
+			      $toid =~ s/'//g; 
+			      $ccid =~ s/'//g;
+			      $sub =~ s/'//g;
+			      $header =~ s/'//g;
+			      $fromid =~ s/^\s+//;
+			      $fromid =~ s/\s+$//;
+			      $ccid =~ s/^\s+//;
+			      $ccid =~ s/\s+$//;
+			      $toid =~ s/^\s+//;
+			      $toid =~ s/\s+$//;
+			
+			      push @rows, "<tr><TD>$fromid </TD><TD>$toid</TD><TD>$ts</TD><TD>$envip</TD><TD>$sub</TD><TD>$numatt</TD><TD>$size</TD> </TR>";
+
+	}
+
+	print $connection "@rows";
+	print $connection "</tbody></table>";
+}
+
+sub delmboxes {
+	($del) = $_[0];
+	@users = split /,/, $del;
+	for(@users) {
+		$mb = File::HomeDir->users_home($_);
+		`rm -rf "$mb/Maildir"`;
+		syslog(LOG_INFO,"Deleted all mails of $_...");
+	}
+}
+
+sub clustering {
+        $ena = `grep ^clusterenable /etc/mp.conf|cut -d' ' -f2`;
+        $carpip = `grep ^clusterip /etc/mp.conf|cut -d' ' -f2`;
+        $dev = `grep ^clusteriface /etc/mp.conf|cut -d' ' -f2`;
+        $vhid = `grep ^clustervhid /etc/mp.conf|cut -d' ' -f2`;
+        if($ena =~ /yes/i) {
+                system("/sbin/ifconfig carp0 destroy");
+                system("/sbin/ifconfig carp0 create $carpip cardev $dev vhid $vh
+id up");
+        } else {
+                system("/sbin/ifconfig carp0 destroy");
+        }
+}
+
+
+# XXX incomplete
+sub listadmin {
+	($admin, $pass, $itvl) - split /\n/, $_[0];
+}
+
+sub locallistadd {
+	($list) = $_[0];
+
+	$admin =`grep "listadmin " /etc/mp.conf|cut -d' '-f2`;
+	chomp($admin);
+	$pass =`grep "listadminpass " /etc/mp.conf|cut -d' '-f2`;
+	chomp($pass);
+	`cd /usr/local/lib/mailman; ./bin/newlist -q $list $admin $pass`;
+}
+
+sub publiclistadd {
+	($list) = $_[0];
+
+	$admin =`grep "listadmin " /etc/mp.conf|cut -d' '-f2`;
+	chomp($admin);
+	$pass =`grep "listadminpass " /etc/mp.conf|cut -d' '-f2`;
+	chomp($pass);
+	`cd /usr/local/lib/mailman; ./bin/newlist -q $list $admin $pass`;
+}
+
+
+sub locallistdel {
+	($list) = $_[0];
+	`cd /usr/local/lib/mailman; ./bin/rmlist $list`;
+}
+
+sub publiclistdel {
+	($list) = $_[0];
+	`cd /usr/local/lib/mailman; ./bin/rmlist $list`;
+}
+
+# XXX incomplete
+sub restorevals {
+
+}
+
+# XXX incomplete
+sub resetallvals {
+
+}
+sub  delayreboot {
+	($t) = $_[0];
+	$t *= 60;
+	sleep($t);
+	exec("/sbin/reboot -q");
+}
+
+sub osghostupld {
+	($ftpsrvr, $anon, $ftpuser, $ftppass ) = split "\n", $_[0];
+	($disk) = split / /,`/sbin/mount`;
+	$disk =~ s/([0-9])([a-z])/$1c/;
+	if($anon =~ /on/) {
+		system("/bin/dd if=$disk bs=32k 2>/tmp/status| /usr/local/bin/curl -sT -  ftp://$ftpsrvr/MailPigeon.img");
+	} else {
+		system("/bin/dd if=/dev/$disk bs=32k 2>/tmp/status | /usr/local/bin/curl -sT - $ftpuser:$ftppass ftp://$ftpsrvr/MailPigeon.img");
+	}
+
+}
+
+sub savesnmpparms {
+        ($name, $loc, $cont, $com) = split /\n/, $_[0];
+        tie @snmp, "Tie::File", "/etc/snmpd.conf" ;
+        for(@snmp) {
+                chomp();
+                if(/system contact/) {
+                        $_ = "system contact \"$cont\"";
+                } elsif(/system location/) {
+                        $_ = "system location \"$loc\"";
+                } elsif(/system description/) {
+                        $_ = "system description \"$name\"";
+                } elsif(/trap community/) {
+                        $_ = "trap community $com";
+                }
+        }
+        untie @snmp;
+        system("pkill snmpd");
+        system("/usr/sbin/snmpd");
+}
+
+sub set_edithost {
+        ($host, $st) = split /\n/, $_[0];
+        tie @syslog, "Tie::File", "/etc/syslog.conf" ;
+        @r = reverse @syslog;
+        for (@r) {
+                chomp();
+                if(/^user.info/) {
+                        if($st eq "OFF") {
+                                $_ = '#user.info        @' . "$host";
+                        } else {
+                                $_ = 'user.info @' . "$host";
+                        }
+                        last;
+                }
+        }
+        @syslog = reverse @r;
+        untie @syslog;
+}
+sub set_msghost {
+        ($host, $st) = split /\n/, $_[0];
+        tie @syslog, "Tie::File", "/etc/syslog.conf" ;
+        for (@syslog) {
+                chomp();
+                if(/^syslog/) {
+                        if($st eq "OFF") {
+                                $_ = '#syslog.*                                         @' ."$host";
+                        } else {
+                                $_ = 'syslog.*                                          @' ."$host";
+                        }
+
+                }
+        }
+        untie @syslog;
+}
+
+sub set_mailhost {
+        ($host, $st) = split /\n/, $_[0];
+        tie @syslog, "Tie::File", "/etc/syslog.conf" ;
+        @r = reverse @syslog;
+        for (@r) {
+                chomp();
+    if(/^mail.info/) {
+                        if($st eq "OFF") {
+                        $_ = '#mail.info                                                @' . "$host";
+                        } else {
+                        $_ = 'mail.info                                         @' . "$host";
+                        }
+                        last;
+                }
+        }
+        @syslog = reverse @r;
+        untie @syslog;
+}
+
+
+sub setmailrate {
+	($mailmaxsrnodes, $mailmax, 
+	$mailmaxsrcconn, $mailmaxsrcstates, $mailmaxsrcconnrate)  = split /\n/, $_[0];
+        tie @pf, "Tie::File", "/etc/pf.cf";
+                for (@pf) {
+			next if(/^#/);
+                        chomp();
+                        if(/^max-src-nodes/) {
+                                $_ = "keep state (max $mailmax,max-src-nodes $mailmaxsrcnodes,max-src-conn-rate $mailmaxsrcconnrate, max-src-conn $mailmaxsrcconn,max-src-states $mailmxsrcstates) ";
+				last;
+			}
+                }    
+        untie @pf;
+        system("/sbin/pfctl -f /etc/pf.conf");
+}
+
+
+sub postfixrate {
+	($samedestdelay, $clientconnratelimit, 
+	$deliveryratelimit, $queuerundelay, $bounceqlifetime, $bouncesize,
+	$maxqlifetime	) = split /\n/, $_[0];
+
+        tie @main, "Tie::File", "/etc/postfix/main.cf";
+                for (@main) {
+			next if(/^#/);
+                        chomp();
+                        if(/^smtpd_client_connection_rate_limit /) {
+                                $_ = "$& = $deliveryratelimit";
+                        } elsif(/^smtpd_client_recipient_rate_limit/) {    
+                                $_ = "$& = $clientconnratelimit";
+                        } elsif(/^default_destination_rate_delay/) {    
+                                $_ = "$& = $samedestdelay";
+                        } elsif(/^bounce_queue_lifetime/) {    
+                                $_ = "$& = $bounceqlifetime";
+                        } elsif(/^bounce_size_limit/) {    
+                                $_ = "$& = $bouncesize";
+                        } elsif(/^maximal_queue_lifetime/) {    
+                                $_ = "$& = $maxqlifetime";
+                        } elsif(/^queue_run_delay/) {    
+                                $_ = "$& = $queuerundelay";
+			}
+                }    
+        untie @main;
+        system("/usr/local/sbin/postfix reload");
+}
+
+sub addldapuser {
+
+	($user, $name, $pass, $phone ) = @_;
+
+	tie @mp, "Tie::File", "/etc/mp.conf";
+	$idx = $#mp;
+	
+	for $var (0 .. $idx) {
+		$_ = $mp[$var];
+		chomp();
+# Skip blank lines and comments
+		next if(/#/);
+
+		if(/\}/ and ($sectionflag eq 1)) {
+			$sectionflag = 0,$cnt = 0;  
+			if($tok eq "ldapusers") {
+				$line = "\t" . $user . "," . $dispname . "," . $pass . "," . $phone;
+				splice @mp, $off, 0, $line;
+				last;
+			}
+			next;
+		}
+
+		if(/^ldapusers/) {
+			$tok = $&; 
+			$off = $var + 1;
+			$sectionflag = 1;
+
+		}
+	}
+	untie @mp;
+
+}
+
+sub ldapaddressbook {
+
+	$ourdomain = `grep ^domain /etc/mp.conf|cut -d' ' -f2`;
+	chomp($ourdomain);
+	@parts = split /\./, $ourdomain;
+	$suff = "ou=People";
+	$suffix = "";
+	for(@parts) {
+		$suff .= ",dc=$_";
+		$suffix .= ",dc=$_";
+	}
+
+	&findvals("ldapusers");
+	@ldapusers = @tokenvals;
+
+	open LDIF, "> /tmp/users.ldif";
+
+	for(@ldapusers) {
+		($login, $dispname, $phone, $pass) = split /,/;
+		($first, $sn) = split / /, $dispname;
+		print LDIF "dn: uid=$login,$suff\n";
+		print LDIF "objectclass: person\n";
+		print LDIF "objectclass: organizationalPerson\n";
+		print LDIF "objectclass: inetOrgPerson\n";
+		print LDIF "uid: $login\n";
+		print LDIF "givenname: $dispname\n";
+		print LDIF "sn: $sn\n";
+		print LDIF "cn: $first\n";
+		print LDIF "telephonenumber: $phone\n";
+		print LDIF "mail: $login\@$ourdomain\n";
+		print LDIF "userpassword: {crypt}3x1231v76T89N\n";
+		print LDIF "\n";
+	}
+
+	close LDIF;
+
+	`/usr/local/bin/ldapadd -x -D cn=admin$suffix -w pigeon1729 -f /var/www/cgi-bin/mp/LDAP/initial.ldif`;
+	`/usr/local/bin/ldapdelete -r -x -D cn=admin$suffix -w pigeon1729 ou=People$suffix`;
+	`/usr/local/bin/ldapadd -x -D cn=admin$suffix -w pigeon1729 -f /tmp/users.ldif`;
+	unlink('/tmp/users.ldif');
+
+}
+
+sub mtamapctl {
+        ($cmd, $mta, $dom) = split /\n/, $_[0];
+        tie @trans, "Tie::File", "/etc/postfix/transport";
+        $mta =~ s/\s//g;
+        $dom =~ s/\s//g;
+        if($cmd eq "delete"){
+                for $idx (0 ..$#trans) {
+                        chomp();
+                        if(/$dom/) {
+                                $lineno = $idx;
+                        }     
+                }    
+                splice @trans, $idx,1;
+        } else {
+                push @trans, "$dom smtp:$mta";
+        }     
+        untie @trans;
+        system("cd /etc/postfix;/usr/local/sbin/postmap transport");
+        system("/usr/local/sbin/postfix reload");
+}
+
+
+sub osghostdl {
+	unlink("/tmp/status");
+	($ftpsrvr, $anon, $disk, $ftpuser, $ftppass) = split "\n", $_[0];
+	$ftpsrvr =~ s/\s//g;
+	$disk =~ s/\s//g;
+	$anon =~ s/\s//g;
+	syslog(LOG_INFO, "[$ftpsrvr] [$anon] [$disk] [$ftpuser] [$ftppass]");
+	if($anon =~ /on/) {
+		syslog(LOG_INFO, "/usr/local/bin/curl -s  ftp://$ftpsrvr/MailPigeon.img | /bin/dd of=/dev/$disk bs=32k");
+		system("/usr/local/bin/curl -s  ftp://$ftpsrvr/MailPigeon.img | /bin/dd of=/dev/$disk bs=32k 2>/tmp/status");
+	} else {
+		system("/usr/local/bin/curl -s  -u ftp://$ftpuser:$ftppass $ftpsrvr/MailPigeon.img | /bin/dd of=/dev/$disk bs=32k 2>/tmp/status");
+	}
+}
+
+sub set_ip {
+	($intf, $ip, $mask) = split /\n/, $_[0];
+	$ret = system("/sbin/ifconfig $intf $ip netmask $mask");
+	open IF, ">/etc/hostname.$intf";
+	print IF "inet $ip $mask\n";
+	close IF;
+	`/bin/chmod 0640 /etc/hostname.$intf`;
+
+ 
+}
+
+sub addchatuser {
+	($user, $pass) = split /\n/, $_[0];
+
+	system("/var/www/cgi-bin/mp/chatusermgmt add $user $pass");
+	syslog(LOG_INFO, "Added chat user $user...");
+}
+
+sub delchatuser {
+	($user) = $_[0];
+
+	system("/var/www/cgi-bin/mp/chatusermgmt delete $user");
+	syslog(LOG_INFO, "Deleting chat user $user...");
+}
+
+sub setpasschatuser {
+	($user, $pass) = split /\n/, $_[0];
+
+	system("/var/www/cgi-bin/mp/chatusermgmt passwd $user $pass");
+	syslog(LOG_INFO, "Setting chat pass for $user...");
+}
+
+
+sub importuserlist {
+	$f = bsd_glob('/var/www/htdocs/upload/*');
+	move($f, '/tmp/users.txt');
+
+my $db = DBI->connect("dbi:Pg:dbname=postgres", "postgres", "panache", {AutoCommit => 1});
+
+if(!defined($db)) {
+	die "Could not connect to Postgres db";
+}
+	$stmt = $db->prepare("delete from login");
+	$stmt->execute();
+	
+	# XXX zero out broker log to begin
+	`:>/var/log/broker`;
+	$virtual =`grep createvirtual /etc/mp.conf|cut -d' '-f2`;
+	chomp($virtual);
+	tie @users, "Tie::File", "/tmp/users.txt";
+
+    	syslog(LOG_INFO, "<div class='news-wrapper'>");
+	syslog(LOG_INFO, "<div class='news-contents'>");
+	for(@users) {
+		($login, $name, $pass, $phone) = split /,/;
+		$name =~ s/"//g;
+		$line = join "\n", $login, $name, $pass;
+
+		
+		# Add to Postgres DB for web login
+		$pass = sha1_hex($pass);
+		$stmt = $db->prepare("insert into login values('$login', '$pass');");
+		$stmt->execute();
+
+		if($virtual eq "no") {
+			&useradd($line); 
+		} else {
+			&addvirtual($line);
+		}
+		&addchatuser($login, $pass);
+		&addldapuser($login, $name,$pass, $phone);
+		syslog(LOG_INFO, "<div style='top: 101px;' class='news'>");
+		syslog(LOG_INFO, "<div class='description'>");
+		syslog(LOG_INFO, "<div class='detail'>Added user $login</div>");
+	      	syslog(LOG_INFO, "<div class='circle-outer'><div class='circle yellow'><span class='day'>$login</span></div></div>");
+	   	syslog(LOG_INFO, "</div></div>");
+		
+
+
+	}
+	syslog(LOG_INFO, " </div></div> ");
+	untie @users;
+	&ldapaddressbook;
+	unlink "/tmp/users.txt";
+	syslog(LOG_INFO, "Users ADDED ");
+	$db->disconnect;
+}
+
+sub addvirtdom {
+	($dom) = $_[0];
+	tie @f, "/etc/postfix/virtual_domains";
+	push @f, $dom unless(grep(/$dom/, @f));
+	untie @f;
+	`postmap /etc/postfix/virtual_domains`;
+}
+
+sub discustomheader {
+	tie @f, "/etc/postfix/main.cf";
+	for(@f) {
+		chomp();
+		if(/header_checks =/) {
+			$_ = '#' . $_;
+		}
+	}
+	untie @f;
+}
+
+sub customheader {
+	@header = `grep ^header /etc/mp.conf|cut -d' ' -f2-`;	
+	open F, ">/etc/postfix/header_checks";
+	print F "/^Content-Transfer-Encoding:/i PREPEND @header\n";
+	close F;
+	tie @f, "/etc/postfix/main.cf";
+	for(@f) {
+		chomp();
+		if(/header_checks =/) {
+			s/#//g;
+		}
+	}
+	untie @f;
+}
+
+sub  discustomfooter {
+	tie @f, "/etc/postfix/master.cf";
+	for(@f) {
+		chomp();
+		if(/smtp\s+inet/) {
+			s/-o content_filter=filter://;
+		}
+	}
+	untie @f;
+}
+
+sub  customfooter {
+	tie @f, "/etc/postfix/master.cf";
+	for(@f) {
+		chomp();
+		if(/smtp\s+inet/) {
+			$_ .= " -o content_filter=filter:";
+		}
+	}
+	untie @f;
+}
+
+sub addvirtuser {
+	($user, $dom) = split /\n/, $_[0];
+	tie @f, "/etc/postfix/virtual_mailbox";
+	push @f, "$user\@$dom $dom/$user/Maildir/" unless(grep(/$user/, @f));
+	
+	untie @f;
+	`postmap /etc/postfix/virtual_mailbox`;
+	mkdir("/var/mail/vmail/$dom/");
+	mkdir("/var/mail/vmail/$dom/$user");
+	`chown -R vmail /var/mail/vmail`;
+
+}
+
+sub localusers {
+	@users = split /\n/, $_[0];
+	@lines = ();
+	for(@users) {
+		push @lines, "$_  permissive";
+	}
+	open F, ">/etc/postfix/restricted_senders";	 
+	print F @lines;
+	close F;
+}
+
+sub accrecip {
+	@users = split /\n/, $_[0];
+	@lines = ();
+	for(@users) {
+		push @lines, "$_  permissive";
+	}
+	open F, ">/etc/postfix/recipient_access";	 
+	print F @lines;
+	close F;
+}
+
+sub accsenders {
+	@users = split /\n/, $_[0];
+	@lines = ();
+	for(@users) {
+		push @lines, "$_  permissive";
+	}
+	open F, ">/etc/postfix/restricted_senders";	 
+	print F @lines;
+	close F;
+}
+
+sub dovecotsettings {
+	( $ignoredom, $secureimap, $imapgreeter) = split /\n/, $_[0];
+	tie @f, "/etc/dovecot/dovecot.conf";
+
+
+	tie @dove, "Tie::File", "/etc/dovecot/dovecot.conf";
+	for(@dove) {
+		next if(/^#/);
+		if(/login_greeting =/) {
+			$_ = "login_greeting = $imapgreeter";
+		} elsif(/protocols =/) {
+			if($secureimap =~ /yes/i) {
+				$_ = "protocols = imap pop3 lmtp imaps pop3s";
+			} else {
+				$_ = "protocols = imap pop3 lmtp";
+			}
+
+		}
+
+	}
+
+	untie @dove;
+
+	tie @auth, "Tie::File", "/etc/dovecot/conf.d/10-auth.conf";
+	for(@auth) {
+		if(/auth_username_format/) {
+			if($ignoredom =~ /yes/i) {
+				s/#//g;
+			} else {
+				s/^/#/;
+			}
+			last;
+		}
+	}
+
+	untie @auth;
+}
+
+sub genericsettings {
+
+	$createvirtual =`grep "createvirtual " /etc/mp.conf|cut -d' '-f2`;
+	$dsn =`grep "dsn " /etc/mp.conf|cut -d' '-f2`;
+
+	&findvals("ourdomains");
+	@ourdomains = @tokenvals;
+
+	$dom = join " ", @ourdomains;
+	tie @maincf, "Tie::File", "/etc/postfix/main.cf";
+	for(@maincf) {
+		chomp();
+		if(/^relay_domains/) {
+			$_ = "relay_domains =  @ourdomains";
+		}
+	}
+
+	&findvals("mtamap");
+	@mtamap = @tokenvals;
+
+	tie @trans, 'Tie::File', '/etc/postfix/transport' or die "Could  not open Postfix transport for writing"; 
+	push @trans, @mtamap;
+	untie @trans;
+	`cd /etc/postfix; /usr/local/sbin/postmap transport; /usr/local/sbin/postfix reload`;
+}
+
+
+sub addvirtuserdovecot {
+	($user, $pass) = split /\n/, $_[0];
+	tie @f, "/etc/dovecot/passwd";
+	push @f, "$user:{PLAIN}$pass" unless(grep(/$user/, @f));
+	untie @f;
+}
+
+sub applylogo {
+	$f = bsd_glob('/var/www/htdocs/upload/*');
+	move($f, '/var/www/htdocs/images/logo.png');
+}
+
+
+sub movebackup {
+        $f = bsd_glob('/var/www/htdocs/upload/*');
+        move($f, '/tmp/mp.conf');
+
+}
+
+
+sub movelicense {
+	$f = '/var/www/htdocs/upload/license.img';
+	($out) = readpipe "openssl aes-256-cbc -d -k saraswathy1729 -in $f";
+	if($out =~ /License/) {
+		move($f, '/etc/license.img');
+		# Reset license begin time
+		($file) = </etc/hostname.*>;
+		`touch $file`;
+		syslog("info", "License imported successfully!");
+		print $connection "SUCCESS";
+	} else {
+		syslog(LOG_ERR, "License file corrupt!");
+		print $connection "FAILURE";
+	}
+	
+}
+
+sub publicfolders {
+	($folder, $foldername, $workgroup) = split/\n/, $_[0];
+
+	tie @smb, 'Tie::File', "/etc/samba/smb.conf";
+	for(@smb) {
+		if(/path/) {
+			$_ = "path = $folder ";
+		} elsif(/workgroup/) {
+			$_ = "workgroup = $workgroup ";
+		} elsif(/server string/) {
+			$_ = "server string = $foldername ";
+		}
+	}
+	untie @smb;
+	`/etc/rc.d/samba restart`;
+
+}
+
+sub strictusercontrols {
+	($flag) = $_[0];
+	tie @main, "/etc/postfix/main.cf";
+	$cnt = 0, $start = 0;
+	for(@main) {
+		chomp();
+		if($start eq 1) {
+			$cnt++;
+
+			if($flag =~ /yes/) {
+				s/#//;
+			} else {
+				$_ = '#' . $_;
+			}
+			last if(/restrictive =/);
+			last if($cnt eq 8);
+			next;
+		}
+		if(/User controls/) {
+			$start = 1;
+			next;
+		}
+
+	}
+	untie @main;
+	`postfix reload`;
+}
+
+
+sub usercontrols {
+	tie @mp, "Tie::File", "/etc/mp.conf", mode => O_RDONLY;
+	$sec = 0;
+	@values = (); 
+	for(@mp) {
+		chomp();
+		next if(/#/);
+
+		if(/\}/ and ($sec eq 1)) {
+			$sec= 0,$cnt = 0;  
+			if($tok =~ /blockedmail/) {
+				@blocked = @values;
+			} elsif($tok =~ /accsenders/) {
+				@accsenders = @values;
+			} elsif($tok =~ /accsenders/) {
+				@accrecip = @values;
+			} elsif($tok =~ /localsenders/) {
+				@localsenders = @values;
+			}
+			@values = (); 
+			next;
+		}
+
+		if($sec eq 1) {
+			$cnt++;
+			push @values, $_ . "\n"; 
+			next;
+		}
+		if(/^blockedmail/) {
+			$tok = $&; 
+			$off = $var + 1;
+			$sectionflag = 1;
+		} elsif(/^accsenders/) {
+			$tok = $&; 
+			$off = $var + 1;
+			$sectionflag = 1;
+		} elsif(/^accrecip/) {
+			$tok = $&; 
+			$off = $var + 1;
+			$sectionflag = 1;
+		} elsif(/^localsenders/) {
+			$tok = $&; 
+			$off = $var + 1;
+			$sectionflag = 1;
+		}
+	}
+	untie @mp;
+
+	tie @maincf, "Tie::File", "/etc/postfix/deny";
+	@mailcf = @blocked;
+	untie @maincf;
+	`cd /etc/postfix; postmap deny`;
+
+	for(@accsenders) {
+		$_ .= " permissive";
+	}
+	tie @maincf, "Tie::File", "/etc/postfix/recipient_access";
+	@mailcf = @accsenders;
+	untie @maincf;
+	`cd /etc/postfix; postmap recipient_access`;
+
+	for(@accrecip) {
+		$_ .= " restrictive";
+	}
+	tie @maincf, "Tie::File", "/etc/postfix/recipient_access";
+	@mailcf = @accrecip;
+	untie @maincf;
+	`cd /etc/postfix; postmap recipient_access`;
+
+	for(@accrecip) {
+		$_ .=  " local_only";
+	}
+	tie @maincf, "Tie::File", "/etc/postfix/restricted_senders";
+	@mailcf = @localsenders;
+	untie @maincf;
+	`cd /etc/postfix; postmap restricted_senders`;
+
+}
+
+sub webmailcontrols {
+	( $preview, $htmlcompose, $forcehttps, $webmailurl) = split /\n/,$_[0];
+	tie @rcube, "Tie::File", "/var/www/htdocs/webmail/config/main.inc.php";
+	for(@rcube) {
+		if(/preview_pane/) {
+			if($preview =~ /undefined/) {
+				s/true/false/;
+			} else {
+				s/false/true/;
+			}
+		}elsif(/froce_https/) {
+			if($forcehttps =~ /undefined/) {
+				s/true/false/i;
+			} else {
+				s/false/true/i;
+			}
+		}elsif(/htmleditor/) {
+			if($htmlcompose =~ /undefined/) {
+				s/true/false/;
+			} else {
+				s/false/true/;
+			}
+		}
+	}
+	untie @rcube;
+	tie @apache, "Tie::File", "/var/www/conf/httpd.conf";
+	for(@apache) {
+		s/webmail/$webmailurl/;
+	}
+	untie @apache;
+}
+
+sub applywebmaillogo {
+	$f = bsd_glob('/var/www/htdocs/upload/*png');
+	move($f, '/var/www/htdocs/webmail/skins/default/images/roundcube_logo.png');
+}
+
+sub moveconfig {
+	$f = bsd_glob('/var/www/htdocs/upload/mp.conf');
+	move($f, '/var/www/etc/mp.conf');
+}
+
+sub addvirtual {
+	($login, $name, $userpass) = split /\n/, $_[0];
+
+	tie @virtual, "Tie::File", "/etc/postfix/virtual_mailbox";
+	($user, $domain) = split/\@/, $login;
+	push @virtual, "$login $domain/$user/Maildir/";
+	untie @virtual;
+	tie @virpass, "Tie::File", "/etc/dovecot/passwd";
+	push @virpass, "$login:{PLAIN}$userpass";
+	untie @virpass;
+	`pkill -HUP dovecot`;
+}
+
+sub useradd {
+	($login, $name, $userpass) = split /\n/, $_[0];
+
+	$pass = readpipe "/usr/bin/encrypt -b 6 $userpass";
+
+	$quotedpass = quotemeta $pass;
+
+	`/usr/sbin/useradd -p $quotedpass -s /bin/rksh -c \"$name\" -m -d /disk/home/$login $login`;
+	
+}
+
+sub relaybackup {
+ 	&findvals("relaydomains");
+	@relay = @tokenvals;
+	s/\s//g for(@relay);
+	chomp() for(@relay);
+ 	&findvals("backupdomains");
+	@backup = @tokenvals;
+	s/\s//g for(@backup);
+	chomp() for(@backup);
+
+	@doms = ();
+	push @doms,@relay; 
+	push @doms,@backup; 
+
+	tie @relayrecip, "Tie::File", "/etc/postfix/access";
+	@relayrecip = ();
+	for $dom (@relay) {
+		push @relayrecip, "$dom OK";
+	}
+
+	untie @relayrecip;
+	`postmap /etc/postfix/relay_recipients`;
+	`postfix reload`;
+}
+
+sub rm_fwd {
+	($login) = $_[0];
+	$home = File::HomeDir->users_home($login);
+	unlink("$home/.forward");
+}
+
+sub aliases {
+	&findvals("system_aliases");
+	@sys = @tokenvals;
+	tie @al, "Tie::File", "/etc/mail/aliases";
+	for $idx (0..$#al) {
+		$_ = $al[$idx];
+		chomp();
+		if(/XXX MailPigeon/){
+			@al[$idx + 1..$#al] = @sys;
+			last;
+		}
+	}
+	`/usr/bin/newaliases`;
+
+	&findvals("local_aliases");
+	@loc = @tokenvals;
+	tie @al, "Tie::File","/etc/postfix/virtual";
+	@al = @loc;
+	untie @al;
+	
+}
+	
+sub userdel {
+	@users = split /\n/, $_[0];
+
+	for $user (@users) {
+		`/usr/sbin/userdel -r $user`;
+		&delchatuser($user);
+	}
+}
+
+sub pinghost {
+        ($h) = @_;
+        @out = `/sbin/ping -c 10 -i 0.2 -w 1 $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+sub tracehost {
+        ($h) = @_;
+        @out = `usr/sbin/traceroute -n $h 2>&1`;
+        chomp() for @out;
+        $o = join ",", @out;
+        print $connection $o;
+}
+
+
+
+sub monitctl {
+	($action) = $_[0];
+	if($action =~ /start/) {
+		system("pkill -9 monit");
+		system("/usr/local/bin/monit");
+	} elsif($action =~/restart/) {
+		system("/usr/local/bin/monit reload");
+	} elsif($action =~/unmonitor/) {
+		system("/usr/local/bin/monit unmonitor all");
+	} elsif($action =~/stop/) {
+		system("/usr/local/bin/monit stop all");
+	} else {
+		syslog(LOG_INFO, "Stopping monit");
+		system("pkill -9 monit");
+	}
+
+}
+
+sub monitglobal {
+	($alflg, $mailid, $freq, @albody) = split /\n/, $_[0];
+
+	if($freq =~ /tenminutes/) {
+		$intv = 10 * 60;
+	} elsif($freq =~ /twminutes/) {
+		$intv = 20 * 60;
+	} elsif($freq =~ /forminutes/) {
+		$intv = 40 * 60;
+	} elsif($freq =~ /hourly/) {
+		$intv = 60 * 60;
+	} elsif($freq =~ /bihourly/) {
+		$intv = 120 * 60;
+	}
+tie @monit, "Tie::File", "/etc/monitrc";
+	$last = $#monit;
+	for $idx (0 .. $last) {
+		$_ = $monit[$idx];
+		chomp();
+		next if(/^#/);
+		if(/^set daemon/) {
+			$monit[$idx] = "set daemon $intv";
+			syslog(LOG_INFO, "interval $_");
+		} elsif(/^set alert/) {
+			$monit[$idx] = "set alert $mailid";
+			syslog(LOG_INFO, "mailid $_");
+		} elsif(/^set mail-format/) {
+			$off = $idx + 4;
+		}
+ 	
+	}
+	$monit[$off] = qq(@albody);
+	untie @monit;
+	`/usr/local/bin/monit -c /etc/monitrc reload`;
+
+}
+
+sub monitdaemons {
+	($apache, $clamd, $grey, $spamd,
+		   $spamlogd, $proxy) = split /\n/, $_[0];
+
+tie @monit, "Tie::File", "/etc/monitrc";
+	$last = $#monit;
+	@tr = ();
+	for $idx (0 .. $last) {
+		$_ = $monit[$idx];
+		chomp();
+		next if(/^#/);
+		if(/check process apache/) {
+			if($apache =~ /on/) {
+			push @tr, 
+qw(
+ # XXX Apache
+check process apache with pidfile /var/www/logs/http.pid
+   start program = "/usr/sbin/httpd -DSSL"
+   stop program = "/usr/bin/pkill httpd"
+              if cpu > 60% for 2 cycles then alert
+              if cpu > 80% for 5 cycles then restart
+              if mem > 100 MB for 5 cycles then stop
+              if loadavg(5min) greater than 10.0 for 8 cycles then stop
+   if 5 restarts within 5 cycles then timeout
+);
+
+
+			} else {
+				$_ = '#' . $_;
+				$ln = $monit[$idx + 1] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 2] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 3] ;
+				$ln = '#' . $ln;
+			}
+		} elsif(/check process sshd/) {
+			if($sshd =~ /on/) {
+			push @tr, 
+qq(
+# SSHD
+ check process sshd with pidfile /var/run/sshd.pid
+   start program  "/usr/sbin/sshd "
+   stop program  "/usr/bin/pkill sshd"
+   if failed port 22 protocol ssh then restart
+   if 5 restarts within 5 cycles then timeout
+);
+
+
+			} else {
+				$_ = '#' . $_;
+				$ln = $monit[$idx + 1] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 2] ;
+				$ln = '#' . $ln;
+				$ln = $monit[$idx + 3] ;
+				$ln = '#' . $ln;
+			}
+		} 
+	}
+	push @monit, @tr;
+	untie @monit;
+	`/usr/local/bin/monit -c /etc/monitrc reload`;
+
+}
+
+sub monitmta {
+		
+	($mtaip, $mtaport) = split /\n/, $_[0];
+	tie @monit, "Tie::File", "/etc/monitrc";
+	for $idx (0..$#monit) {
+		$_ = $monit[$idx];
+		chomp();
+# Leave comments out
+		next if(/^#/);
+		if(/check host mta with address/) {
+			$monit[$idx] = "check host mta with address $mtaip";
+			$monit[$idx + 1] = "if failed port $mtaport protocol smtp then alert";
+			last;
+		} 
+	}
+	untie @monit;
+	`/usr/local/bin/monit -c /etc/monitrc reload`;
+
+}
+
+sub monitsystem {
+		
+	($cpu, $mem, $swap, $nw, $dfslash, $dfvar)
+		 = split /\n/, $_[0];
+tie @monit, "Tie::File", "/etc/monitrc";
+	for (@monit) {
+		chomp();
+# Leave comments out
+		next if(/^#/);
+		if(/cpu usage \(user\)/) {
+			s/(\d+)%/$cpu%/;
+		} elsif(/memory usage/) {
+			s/(\d+)%/$mem%/;
+		} elsif(/device rootfs/) {
+			s/(\d+)%/$dfslash%/;
+		} elsif(/device varfs/) {
+			s/(\d+)%/$dfvar%/;
+		} elsif(/icmp type echo/) {
+			s/timeout (\d+)/timeout $nw/;
+		} 
+	}
+	untie @monit;
+	`/usr/local/bin/monit -c /etc/monitrc reload`;
+
+}
+
+sub usermod {
+	($login, $disname, $pass) = split /\n/, $_[0];
+
+	$passwd  = readpipe "/usr/bin/encrypt -b 6 $pass";
+
+	$quotedpass = quotemeta $passwd;
+
+	`/usr/sbin/usermod -p $quotedpass -c \"$displayname\" $login`;
+	&setpasschatuser($login, $pass);
+
+}
+
+sub addroute {
+        ($net, $dest) = split / /,$_[0];
+        syslog(LOG_INFO, "Net is [$net] and dest is [$dest]");
+        $net =~ s/\s//g;
+        system("/sbin/route add $net $dest");
+        system("/sbin/route add -net $net $dest");
+}
+sub delroute {
+        $_[0] =~ s/\s+/ /g;
+        ($dest) = $_[0];
+        system("/sbin/route delete $dest");
+}
+
+
+sub smtpproto {
+	($cram, $dig, $login, $plain, $ldap) = split /\n/, $_[0];
+	
+	tie @maincf, "Tie::File", "/etc/postfix/main.cf";
+	for(@maincf) {
+		chomp();
+		if(/^smtpd_sasl_auth_enable/) {
+			if($plain =~ /undefined/) {
+				$_ = '#' . $_;
+			} else {
+				s/^#//;
+			}
+		}
+		if(/ldap:/) {
+			if($ldap =~ /undefined/) {
+				$_ = '#' . $_;
+			} else {
+				s/^#//;
+			}
+		}
+	}
+	untie @maincf;
+	`postfix reload`;	
+}
+
+
+sub postfix_basic {
+	($dom, $hname, $lnet, $rnet, $rdoms) = split /\n/, $_[0];
+	tie @maincf, "Tie::File", '/etc/postfix/main.cf' or syslog(LOG_ERR, "Could  not open /etc/postfix/main.cf for writing"); 
+	for(@maincf) {
+		chomp();
+		# skip comments
+		next if(/^#/);
+		if(/^mynetworks/) {
+			$_ = "mynetworks = 127.0.0.0/8, $lnet, $rnet";
+		} elsif(/^mydomain/) {
+			$_ = "mydomain = $dom";
+		} elsif(/^myhostname/) {
+			$_ = "myhostname=$hname";
+		} elsif(/^relay_domains/) {
+			$_ = "relay_domains = $rdoms";
+		}
+	}
+	untie @maincf;
+	`/usr/local/sbin/postfix reload`;
+
+	tie @httpd, "Tie::File", "/var/www/conf/httpd.conf";
+	for(@httpd) {
+		chomp();
+		# skip comments
+		next if(/^#/);
+		if(/^ServerName/) {
+			$_ = "ServerName $hname";
+		}
+	}
+	untie @httpd;
+
+	tie @f, "Tie::File", "/etc/myname";
+	$f[0] = $hname;
+	untie @f;
+
+	tie @f, "Tie::File", "/etc/hosts";
+	for(@f) {
+		if(/127\.0\.0\.1/) {
+			$_ = "127.0.0.1		localhost $dom";		
+		}	
+	}
+	untie @f;
+	
+
+	# Fix our LDAP server domain also	
+	@parts = split /\./, $dom;
+	$suffix = "";
+	for(@parts) {
+		$suffix .= ",dc=$_";
+	}
+	$suffix =~ s/^,//;
+	tie @f, "Tie::File", "/etc/openldap/slapd.conf";
+	for(@f) {
+		chomp();
+		# skip comments
+		next if(/^#/);
+
+		if(/^suffix/) {
+			$_ = "suffix		\"$suffix\"";
+		} elsif(/^rootdn/) {
+			$_ = "rootdn		\"cn=admin,$suffix\"";
+		}
+	}
+	untie @f;
+	`/etc/rc.d/slapd restart`;
+	#  Add chatroom entry
+	tie @f, "Tie::File", "/etc/prosody/prosody.cfg.lua";
+	for(@f) {
+		chomp();
+		# skip comments
+		next if(/^#/);
+
+		if(/"muc/) {
+			$_ = "Component \"conference.$dom\" ";
+		}
+	}
+	untie @f;
+	`/etc/rc.d/prosody restart`;
+
+
+	
+}
+
+sub global_mail {
+	($greeter, $submiss, $auth, $ldaproto, $webmail, $wrongid, $quotamgmt) = split /\n/, $_[0];
+	tie @main, 'Tie::File', '/etc/postfix/main.cf' or die "Could  not open /etc/postfix/main.cf for writing"; 
+	for(@main) {
+		chomp();
+		if(/^smtpd_banner/) {
+			$_ = "smtpd_banner = \"$greeter\" ";
+		} elsif(/^smtpd_sasl_auth_enable/) {
+			if($auth =~ /yes/) {
+				$_ = '#' . $_;
+			} else {
+				s/^#//;
+			}
+		} elsif(/^luser_relay/) {
+			if($wrongid =~ /catch/) {
+				$_ = "$& = admin+$relay";
+			} else {
+				$_ = "$& = ";
+			}
+		}
+	}
+	untie @main;
+	tie @master, 'Tie::File', '/etc/postfix/master.cf' or die "Could  not open /etc/postfix/master.cf for writing"; 
+	for(@master) {
+		chomp();
+		if(/submission/) {
+			if($submiss =~ /yes/) {
+				$_ =~ s/^#//;
+			} else {
+				$_ = '#' . $_;
+			}
+		}
+	}
+	untie @master;
+	tie @dovecot, 'Tie::File', '/etc/dovecot/dovecot.conf' or die "Could  not open /etc/dovecot/dovecot.conf for writing"; 
+	for(@dovecot) {
+		chomp();
+		next if(/^#/);
+		if(/^protocols /) {
+			if($ldaproto =~ /both/) {
+				$_ = "protocols = imap pop3 lmtp";
+			} elsif($ldaproto =~ /pop3/i) {
+				$_ = "protocols = pop3 lmtp";
+			} elsif($ldaproto =~ /imap/i) {
+				$_ = "protocols = imap lmtp";
+			}
+		}
+	}
+	untie @dovecot;
+	tie @apache, "Tie::File", "/var/www/conf/httpd.conf";
+	$st = 0;
+	if($webmail =~ /no/) {
+		for(@apache) {
+			chomp();
+			next if(/^#/);
+			if($st eq 1 and /\/Directory/) {
+				$_ = '#' . $_;
+				last;
+			}
+			if($st eq 1) {
+				$_ = '#' . $_;
+			}
+			if(/htdocs\/webmail/) {
+				$st = 1;
+			}
+		}
+	} else {
+		for(@apache) {
+			chomp();
+			next if(/^#/);
+			if($st eq 1 and /\/Directory/) {
+				s/^#//;
+				last;
+			}
+			if($st eq 1) {
+				s/^#//;
+			}
+			if(/htdocs\/webmail/) {
+				$st = 1;
+			}
+		}
+	}
+	untie @apache;
+	`/usr/sbin/apachectl restart`;
+	tie @fstab, "Tie::File", "/etc/fstab";
+	for(@fstab) {
+		if(/rw 1 1/) {
+			if($quotamgmt =~ /yes/) {
+				s/rw/rw,userquota,groupquota/;
+				`/usr/sbin/quotaon -a`;
+			} else {
+				s/rw,userquota,groupquota/rw/;
+			}
+			last;
+		}
+	}
+	untie @fstab;
+}
+
+sub getmailq {
+	@lines = `/usr/local/sbin/postqueue -p`;
+	$ln = join "", @lines;
+	print $connection $ln;
+}
+
+sub dispqmail {
+	($id) = $_[0];
+	@out = `/usr/local/sbin/postcat -qbh $id`;
+	$ln = join "", @out;
+	open F, ">/var/www/tmp/.qmail";
+	print F $ln;
+	close F;
+}
+
+sub flushq {
+	`/usr/local/sbin/postqueue -f`;
+}
+
+sub flushqmail {
+	($id) = $_[0];
+	`/usr/local/sbin/postqueue -i $id`;
+}
+
+sub delq {
+	`/usr/local/sbin/postsuper -d ALL`;
+}
+
+sub delqmail {
+	($id) = $_[0];
+	`/usr/local/sbin/postsuper -d $id`;
+}
+
+
+sub getmailquser {
+	($login) = @_;
+	@lines = `/usr/local/sbin/postqueue -p|grep $login`;
+	$ln = join "", @lines;
+	print $connection $ln;
+}
+
+
+sub postfixquotamgmt {
+	($attsize, $mboxsize) = split /\n/, $_[0];
+
+	$attsize *=1024*1024;
+	$mboxsize *=1024*1024;
+
+	tie @maincf, "Tie::File", '/etc/postfix/main.cf' or 
+	   syslog(LOG_ERR, "Could  not open /etc/postfix/main.cf for writing"); 
+	for(@maincf) {
+		chomp();
+		# skip comments
+		next if(/^#/);
+		if(/^mailbox_size_limit/) {
+			$_ = "$& = $mboxsize";
+		} elsif(/^message_size_limit/) {
+			$_ = "$& = $attsize";
+		}
+	}
+	untie @maincf;
+	`/usr/local/sbin/postfix reload`;
+}
+
+sub setuserquota {
+	($user, $quota) = split /\n/, $_[0];
+
+	$quota *= 1024;
+
+open F, "|export EDITOR=ed;edquota -u $user";
+
+print F <<EOT;
+2s/soft =.*,/soft = $quota,/
+2s/hard =.*)/hard = $quota)/
+w
+q
+EOT
+
+close F;
+
+}
+
+sub deleteuserquota {
+	($user) = split /\n/, $_[0];
+open F, "|export EDITOR=ed;edquota -u $user";
+
+print F <<EOT;
+2s/soft =.*,/soft = 0,/
+2s/hard =.*)/hard = 0)/
+w
+q
+EOT
+
+close F;
+
+
+}
+
+sub setgroupquota {
+	($group, $quota) = split /\n/, $_[0];
+	$quota *= 1024;
+open F, "|export EDITOR=ed;edquota -g $group";
+
+print F <<EOT;
+2s/soft =.*,/soft = $quota,/
+2s/hard =.*)/hard = $quota)/
+w
+q
+EOT
+
+close F;
+
+
+}
+
+sub deletegroupquota {
+	($group, $quota) = split /\n/, $_[0];
+open F, "|export EDITOR=ed;edquota -g $group";
+
+print F <<EOT;
+2s/soft =.*,/soft = 0,/
+2s/hard =.*)/hard = 0)/
+w
+q
+EOT
+
+close F;
+
+
+}
+	
+sub postfix_trans {
+	(@args) = split /\n/, $_[0];
+	tie @trans, 'Tie::File', '/etc/postfix/transport' or die "Could  not open Postfix transport for writing"; 
+	push @trans, @args;
+	untie @trans;
+}
+
+sub setstopts {
+	($int, $tcpclosing, $tcpclosed, $finwait) = split /\n/, $_[0];
+	tie @pf, "Tie::File", '/etc/pf.conf' or die "could not open pf.conf for writing";
+	for(@pf) {
+		chomp;
+		if(/tcp.closed\s+(\d+)/) {
+			$_ = "set timeout tcp.closed $tcpclosed";
+		} elsif(/interval\s+(\d+)/) {
+			$_ = "set timeout interval $int";
+		} elsif(/tcp.closing\s+(\d+)/) {
+			$_ = "set timeout tcp.closing $tcpclosing";
+		} elsif(/tcp.finwait\s+(\d+)/) {
+			$_ = "set timeout tcp.finwait $finwait";
+		} 
+
+	}
+	untie @pf;
+	`/sbin/pfctl -f /etc/pf.conf`;
+}
+
+sub set_gwy {
+	($gatewaytext) = $_[0];
+	system("/sbin/route delete default 2>/dev/null 1>&2");
+	$ret = system("/sbin/route add default -host $gatewaytext");
+	open GWY, ">/etc/mygate";
+	print GWY "$gatewaytext\n";
+	close GWY;
+	print $connection "SUCCESS";
+
+ 
+}
+
+sub ntputctime {
+	($ntptoggle, $utctoggle) = @_;
+	if($ntptoggle eq "yes") {
+		system("pkill ntpd");
+		system("/usr/sbin/ntpd");
+	} else {
+		system("pkill ntpd");
+	}
+	if($utctoggle eq "yes") {
+ 		`/bin/rm /etc/localtime 2>/dev/null`;
+	} else {
+		;
+	}
+}
+
+sub mailfwd {
+	@users = &get_user_list;
+	for(@users) {
+		&rm_fwd($_);
+	}
+
+	&findvals("forwards");
+	@fwd = @tokenvals;
+
+	for(@fwd) {
+		($login, $fwd) = split /:/;
+		$login =~ s/\s//g;
+
+		$home = File::HomeDir->users_home($login);
+		open F, ">$home/.forward";
+		print F $fwd;
+		close F;
+	}
+}
+
+sub mailusermgmt {
+	&findvals("mailusers");
+	@mailusers = @tokenvals ; 
+	my $db = DBI->connect("dbi:Pg:dbname=postgres", "postgres", "panache", {AutoCommit => 1});
+	$stmt = $db->prepare("delete from login");
+	$stmt->execute();
+
+	if(!defined($db)) {
+		die "Could not connect to Postgres db";
+	}
+	for(@mailusers) {
+		($mailuser, $password, $displayname, $phone) = split /,/;
+		$mailuser =~ s/\s//g;
+
+		$line = join "\n", $mailuser, $displayname, $password;
+
+		# Add to Postgres DB for web login
+		$pass = sha1_hex($password);
+		$stmt = $db->prepare("insert into login values('$mailuser', '$pass');");
+		$stmt->execute();
+		&useradd($line);
+	}
+
+	$db->disconnect;
+
+	&aliasesgroups;
+	
+}
+
+sub aliasesgroups {
+	&findvals("aliases");
+	@aliases = @tokenvals ; 
+	@mailal = ();
+	for $al (@aliases) {
+		&findvals("${al}_alias");
+		@alusers = @tokenvals;
+		$ln = join " ", @alusers;
+		push @mailal, "$al : $ln";
+		
+	}
+	&findvals("groups");
+	@groups = @tokenvals ; 
+	tie @alfile, "Tie::File", "/etc/mail/aliases";
+	for $no (0..$#alfile) {
+		if($alfile[$no] =~ /XXX MailPigeon/) {
+			@alfile[$no..$#alfile] = @mailal;
+			last;
+		}
+	}
+	untie @alfile;
+	system("/usr/bin/newaliases");
+}
+
+# --- XXX Curses ---#
+sub set_timezone {
+	($zone) = $_[0];
+ 	`/bin/rm /etc/localtime 2>/dev/null`;
+        `ln -s /usr/share/zoneinfo/$zone /etc/localtime`;
+ 
+}
+
+sub settime {
+	($time) = $_[0];
+        `/bin/date $time`;
+ 
+}
+
+sub show_pktstat {
+	@lines = `/usr/local/bin/pktstat -FB1 -w1`;
+	print $connection @lines;
+}
+
+sub show_raw_pkt {
+	@lines = `/usr/sbin/tcpdump -tt -qnIo -c 5`;
+	print $connection @lines;
+}
+
+sub mountfmtdisk {
+	($disk) = $_[0];
+	$disk =~ s/\s//g;
+
+	`/sbin/disklabel $disk > /tmp/f`;
+
+	tie @f, "Tie::File", "/tmp/f";
+	for(@f) {
+		if(/^boundstart: (\d+)/) {
+			$st = $1;
+		} elsif(/^boundend: (\d+)/) {
+			$end = $1;
+			$end -= 64;
+		}
+	}
+	splice @f, $#f, 0, "  a: \t\t $end \t\t $st 4.2BSD \t 2048 \t 16384 \t 1";
+
+	untie @f;
+	`/sbin/disklabel -R $disk /tmp/f; rm /tmp/f;`;
+
+	system("/sbin/newfs -q ${disk}a");	
+	system("/sbin/mount /dev/${disk}a /disk");
+	tie @fstab, "Tie::File", "/etc/fstab";
+	push @fstab, "/dev/${disk}a /disk ffs rw 1 1";
+	untie @fstab;
+}
+
+sub formatmirrmnt {
+	system("/sbin/newfs -q ccd0a");	
+	system("/sbin/umount /disk");
+	system("/sbin/mount /dev/ccd0a /disk");
+}
+
+sub setupmirror {
+	($disk1, $disk2) = split "\n", $_[0];
+
+	$disk1 =~ s/\s//g;
+	$disk2 =~ s/\s//g;
+	syslog(LOG_INFO, "I get disks [$disk1] and [$disk2]");
+	open F, ">/etc/ccd.conf";
+	print F "ccd0 	16 	CCDF_MIRROR	/dev/${disk1}a /dev/${disk2}a";
+	close F;
+
+
+	`/sbin/disklabel $disk1 > /tmp/f`;
+
+	tie @f, "Tie::File", "/tmp/f";
+	for(@f) {
+		if(/^boundstart: (\d+)/) {
+			$st = $1;
+		} elsif(/^boundend: (\d+)/) {
+			$end = $1;
+			$end -= 64;
+		}
+	}
+	splice @f, $#f, 0, "  a: \t\t $end \t\t $st 4.2BSD \t 2048 \t 16384 \t 1";
+
+	untie @f;
+	`/sbin/disklabel -R $disk1 /tmp/f; rm /tmp/f;`;
+
+		`/sbin/disklabel $disk2 > /tmp/f`;
+
+	tie @f, "Tie::File", "/tmp/f";
+	for(@f) {
+		if(/^boundstart: (\d+)/) {
+			$st = $1;
+		} elsif(/^boundend: (\d+)/) {
+			$end = $1;
+			$end -= 64;
+		}
+	}
+	splice @f, $#f, 0, "  a: \t\t $end \t\t $st 4.2BSD \t 2048 \t 16384 \t 1";
+
+	untie @f;
+	`/sbin/disklabel -R $disk2 /tmp/f; rm /tmp/f;`;
+
+	`/sbin/ccdconfig -U`;
+	`/sbin/ccdconfig -C`;
+	tie @fstab, "Tie::File", "/etc/fstab";
+	push @fstab, "/dev/${disk}a /disk ffs rw 1 1";
+	untie @fstab;
+}
+
+sub reb {
+	exec("/sbin/reboot -q");
+}
+sub cd_reb {
+	exec("/bin/eject cd0 ; /sbin/reboot -q");
+}
+
+sub shut {
+	exec("/sbin/halt -qp");
+}
+
+sub set_tz {
+ 	`/bin/rm /etc/localtime 2>/dev/null`;
+        `ln -s /usr/share/zoneinfo/@_ /etc/localtime`;
+}
+
+#------------------------------Functions--------------------------#
+sub dispatch {
+	($msg, @args) = @_;
+
+	$arg = join " ", @args;
+	chomp($arg);
+	chop($arg);
+	$_ = $msg;
+	s/\.//g;
+
+	syslog(LOG_INFO, " Message is  $_ and arg are $arg");
+	# XXX This place contains the master list of Commands
+	if     (/^CD_REB$/) {
+		syslog(LOG_INFO, "I get a CD_REB message with arg $arg");
+		&cd_reb;
+	} elsif(/^REBOOT$/) {
+		syslog(LOG_INFO, "I get a REBOOT message with arg $arg");
+		&reb;
+	} elsif(/^DELAYREBOOT$/) {
+		syslog(LOG_INFO, "I get a DELAYREBOOT message with arg $arg");
+		&delayreboot($arg);
+	} elsif(/^SHUTDOWN$/) {
+		syslog(LOG_INFO, "I get a SHUTDOWN message with arg $arg");
+		&shut;
+	} elsif(/^SET_TZ$/) {
+		syslog(LOG_INFO, "I get a SET_TZ message with arg $arg");
+		&set_tz($arg);
+	} elsif(/^MAILWEBPROTO$/) {
+		syslog(LOG_INFO, "I get a MAILWEBPROTO message with arg $arg");
+		&mailwebproto;
+	} elsif(/^SAVENWCONFIG$/) {
+		syslog(LOG_INFO, "I get a SAVENWCONFIG message with arg $arg");
+		&savenwconfig($arg);
+	# XXX MailPigeon stuff
+	} elsif(/^DELMBOXES$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&delmboxes($arg);
+	} elsif(/^READMBOX$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&readmbox($arg);
+	} elsif(/^LISTADMIN$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&listadmin($arg);
+	} elsif(/^LOCALLISTADD$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&locallistadd($arg);
+	} elsif(/^PUBLICLISTADD$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&publiclistadd($arg);
+	} elsif(/^LOCALLISTDEL$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&locallistdel($arg);
+	} elsif(/^PUBLICLISTADD$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&publiclistdel($arg);
+	} elsif(/^RESTOREVALS$/) {
+		syslog(LOG_INFO, "I get a RESTOREVALS message with arg $arg");
+		&restorevals($arg);
+	} elsif(/^RESETALLVALS$/) {
+		syslog(LOG_INFO, "I get a RESETALLVALS message with arg $arg");
+		&resetallvals($arg);
+	} elsif(/^OSGHOSTUPLD$/) {
+		syslog(LOG_INFO, "I get a OSGHOSTUPLD message with arg $arg");
+		&osghostupld($arg);
+	} elsif(/^OSGHOSTDL$/) {
+		syslog(LOG_INFO, "I get a OSGHOSTDL message with arg $arg");
+		&osghostdl($arg);
+	} elsif(/^POSTFIXRATE$/) {
+		syslog(LOG_INFO, "I get a $& message with arg $arg");
+		&postfixrate($arg);
+	} elsif(/^MTAMAPCTL$/) {
+		syslog(LOG_INFO, "I get a MTAMAPCTL message with arg $arg");
+		&mtamapctl($arg);
+	} elsif(/^LDAPADDRESSBOOK$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&ldapaddressbook;
+	} elsif(/^APPLYLOGO$/) {
+		syslog(LOG_INFO, "I get a APPLYLOGO with arg $arg");
+		&applylogo;
+	} elsif(/^MOVELICENSE$/) {
+		syslog(LOG_INFO, "I get a MOVELICENSE with arg $arg");
+		&movelicense;
+	} elsif(/^MOVEBACKUP$/) {
+		syslog(LOG_INFO, "I get a MOVEBACKUP with arg $arg");
+		&movebackup;
+	} elsif(/^ADDROUTE$/) {
+		syslog(LOG_INFO, "I get a ADDROUTE with arg $arg");
+		&addroute($arg);
+	} elsif(/^DELROUTE$/) {
+		syslog(LOG_INFO, "I get a DELROUTE with arg $arg");
+		&delroute($arg);
+	} elsif(/^SMTPPROTO$/) {
+		syslog(LOG_INFO, "I get a SMTPPROTO with arg $arg");
+		&smtpproto($arg);
+	} elsif(/^SETSTOPTS$/) {
+		syslog(LOG_INFO, "I get a SETSTOPTS with arg $arg");
+		&setstopts($arg);
+	} elsif(/^SETMAILRATE$/) {
+		syslog(LOG_INFO, "I get a SETMAILRATE with arg $arg");
+		&setmailrate($arg);
+	} elsif(/^SAVESNMPPARMS$/) {
+		syslog(LOG_INFO, "I get a SAVESNMPPARMS with arg $arg");
+		&savesnmpparms($arg);
+	} elsif(/^SET_EDITHOST$/) {
+		syslog(LOG_INFO, "I get a SET_EDITHOST with arg $arg");
+		&set_edithost($arg);
+	} elsif(/^SET_MAILHOST$/) {
+		syslog(LOG_INFO, "I get a SET_MAILHOST with arg $arg");
+		&set_mailhost($arg);
+	} elsif(/^SET_MSGHOST$/) {
+		syslog(LOG_INFO, "I get a SET_MSGHOST with arg $arg");
+		&set_msghost($arg);
+	} elsif(/^SET_IP$/) {
+		syslog(LOG_INFO, "I get a SET_IP with arg $arg");
+		&set_ip($arg);
+	} elsif(/^SET_GWY$/) {
+		syslog(LOG_INFO, "I get a SET_GWY with arg $arg");
+		&set_gwy($arg);
+	} elsif(/^NTPUTCTIME$/) {
+		syslog(LOG_INFO, "I get a NTPUTCTIME with arg $arg");
+		&ntputctime($arg);
+	} elsif(/^SET_TIMEZONE$/) {
+		syslog(LOG_INFO, "I get a SET_TIMEZONE with arg $arg");
+		&set_timezone($arg);
+	} elsif(/^SETTIME$/) {
+		syslog(LOG_INFO, "I get a SETTIME with arg $arg");
+		&settime($arg);
+	} elsif(/^SETLICENSE$/) {
+		syslog(LOG_INFO, "I get a SETLICENSE with arg $arg");
+		&setlicense($arg);
+	} elsif(/^MONITCTL$/) {
+		syslog(LOG_INFO, "I get a MONITCTL with arg $arg");
+		&monitctl($arg);
+	} elsif(/^MONITGLOBAL$/) {
+		syslog(LOG_INFO, "I get a MONITGLOBAL with arg $arg");
+		&monitglobal($arg);
+	} elsif(/^MONITDAEMONS$/) {
+		syslog(LOG_INFO, "I get a MONITDAEMONS with arg $arg");
+		&monitdaemons($arg);
+	} elsif(/^MONITSYSTEM$/) {
+		syslog(LOG_INFO, "I get a MONITSYSTEM with arg $arg");
+		&monitsystem($arg);
+	} elsif(/^PINGHOST$/) {
+		syslog(LOG_INFO, "I get a PINGHOST with arg $arg");
+		&pinghost($arg);
+	} elsif(/^TRACEHOST$/) {
+		syslog(LOG_INFO, "I get a TRACEHOST with arg $arg");
+		&tracehost($arg);
+	} elsif(/^MAILUSERMGMT$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&mailusermgmt($arg);
+	} elsif(/^ALIASESGROUPS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&aliasesgroups($arg);
+	} elsif(/^SETUPMIRROR$/) {
+		syslog(LOG_INFO, "I get a SETUPMIRROR message with args $arg");
+		&setupmirror($arg);
+	} elsif(/^FORMATMIRRMNT$/) {
+		syslog(LOG_INFO, "I get a FORMATMIRRMNT message with args $arg");
+		&formatmirrmnt($arg);
+	} elsif(/^MOUNTFMTDISK$/) {
+		syslog(LOG_INFO, "I get a MOUNTFMTDISK message with args $arg");
+		&mountfmtdisk($arg);
+	} elsif(/^RELAYBACKUP$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&relaybackup;
+	} elsif(/^ALIASES$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&aliases($arg);
+	} elsif(/^POSTFIX_BASIC$/) {
+		syslog(LOG_INFO, "I get a POSTFIX_BASIC message with args $arg");
+		&postfix_basic($arg);
+	} elsif(/^POSTFIX_TRANS$/) {
+		syslog(LOG_INFO, "I get a POSTFIX_TRANS message with args $arg");
+		&postfix_trans($arg);
+	} elsif(/^GLOBAL_MAIL$/) {
+		syslog(LOG_INFO, "I get a GLOBAL_MAIL message with args $arg");
+		&global_mail($arg);
+	} elsif(/^GETMAILQUSER$/) {
+		syslog(LOG_INFO, "I get a GETMAILQUSER message with args $arg");
+		&getmailquser;
+	} elsif(/^GETMAILQ$/) {
+		syslog(LOG_INFO, "I get a GETMAILQ message with args $arg");
+		&getmailq;
+	} elsif(/^DISPQMAIL$/) {
+		syslog(LOG_INFO, "I get a DISPQMAIL message with args $arg");
+		&dispqmail($arg);
+	} elsif(/^FLUSHQ$/) {
+		syslog(LOG_INFO, "I get a FLUSHQ message with args $arg");
+		&flushq;
+	} elsif(/^DELQ$/) {
+		syslog(LOG_INFO, "I get a DELQ message with args $arg");
+		&delq;
+	} elsif(/^DELQMAIL$/) {
+		syslog(LOG_INFO, "I get a DELQMAIL message with args $arg");
+		&delqmail($arg);
+	} elsif(/^IMPORTUSERLIST$/) {
+		syslog(LOG_INFO, "I get a IMPORTUSERLIST message with args $arg");
+		&importuserlist;
+	} elsif(/^DISCUSTOMHEADER$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&discustomheader;
+	} elsif(/^DISCUSTOMFOOTER$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&discustomfooter;
+	} elsif(/^CUSTOMHEADER$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&customheader;
+	} elsif(/^CUSTOMFOOTER$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&customfooter;
+	} elsif(/^ADDCHATUSER$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&addchatuser($arg);
+	} elsif(/^DELCHATUSER$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&delchatuser($arg);
+	} elsif(/^SETPASSCHATUSER$/) {
+		syslog(LOG_INFO, "I get a $& message with args $arg");
+		&setpasschatuser($arg);
+	} elsif(/^ADDVIRTUSER$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&addvirtuser;
+	} elsif(/^ADDVIRTDOM$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&addvirtdom;
+	} elsif(/^ADDVIRTUSERDOVECOT$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&addvirtuserdovecot;
+	} elsif(/^DOVECOTSETTINGS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&dovecotsettings;
+	} elsif(/^GENERICSETTINGS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&genericsettings;
+	} elsif(/^LOCALUSERS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&localusers($arg);
+	} elsif(/^ACCSENDERS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&accsenders($arg);
+	} elsif(/^ACCRECIP$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&accrecip($arg);
+	} elsif(/^POSTFIXQUOTAMGMT$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&postfixquotamgmt($arg);
+	} elsif(/^SETUSERQUOTA$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&setuserquota($arg);
+	} elsif(/^DELETEUSERQUOTA$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&deleteuserquota($arg);
+	} elsif(/^SETGROUPQUOTA$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&setgroupquota($arg);
+	} elsif(/^DELETEGROUPQUOTA$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&deletegroupquota($arg);
+	} elsif(/^MOVECONFIG$/) {
+		syslog(LOG_INFO, "I get a MOVECONFIG with arg $arg");
+		&moveconfig;
+	} elsif(/^APPLYWEBMAILLOGO$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&applywebmaillogo;
+	} elsif(/^USERCONTROLS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&usercontrols;
+	} elsif(/^STRICTUSERCONTROLS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&strictusercontrols($arg);
+	} elsif(/^WEBMAILCONTROLS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&webmailcontrols($arg);
+	} elsif(/^PUBLICFOLDERS$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&publicfolders($arg);
+	} elsif(/^MAILFWD$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&mailfwd;
+	} elsif(/^MAILBOT$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&mailbot;
+	} elsif(/^CLUSTERING$/) {
+		syslog(LOG_INFO, "I get a $& with arg $arg");
+		&clustering;
+	 # XXX Monitoring stuff
+	} elsif(/^SHOW_PKTSTAT$/) {
+		syslog(LOG_INFO, "I get a SHOW_PKTSTAT message with arg $arg");
+		&show_pktstat;
+	} elsif(/^SHOW_RAW_PKT$/) {
+		syslog(LOG_INFO, "I get a SHOW_RAW_PKT message with arg $arg");
+		&show_raw_pkt;
+	} else {
+		syslog(LOG_ERR, " I get a garbled message : [@_]");
+	}
+	$connection->flush;
+	close($connection);
+}
+
+MAIN:
+{
+   # Daemonize
+   Proc::Daemon::Init();
+   $SIG{CHLD} = \&REAPER;
+   # Perform initializes here
+	openlog("Broker-Daemon", "ndelay,pid", "local0");
+	syslog(LOG_INFO, " Opening UNIX socket...");
+	unlink $socketfile;
+ 	my $server = IO::Socket::UNIX->new(Local => $socketfile,
+                                    Type      => SOCK_STREAM,
+                                    Listen    => 32 ) or die $!;
+	chmod 0766, $socketfile;
+   # Enter loop to do work
+	syslog(LOG_INFO, " I am listening now...");
+	for(;;) {
+		$connection = $server->accept();
+		$pid = fork();
+		if($pid) {
+			close($connection);
+			next;
+			# Go back to accept
+		} else {
+			my @lines = ();
+			syslog(LOG_INFO, " read lines @lines...");
+			while($data= <$connection>) {
+				push @lines, $data;
+				if($data =~ /\.\n/) {
+					last;
+				}
+			}
+			if($lines[0] =~ /\w/) {
+				&dispatch(@lines);
+			}
+			exit(0);
+		}
+	}
+}

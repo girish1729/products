@@ -1,0 +1,1197 @@
+#!/usr/bin/perl 
+
+
+###################################################
+#  Init section
+###################################################
+
+
+use Curses::UI;
+use Curses::Widgets;
+use Tie::File;
+use Time::HiRes qw(ualarm);
+use IO::Socket;
+
+$|++;
+
+my ($intf_value, $intvl) = ();
+my ($ipaddrtext, $masktext, $gatewaytext) = ();
+$oneif = 0;
+
+$cui  = new Curses::UI(-clear_on_exit => 1,
+			-color_support => 1);
+
+$win = $cui->add( 'rootwindow' => 'Window',
+			-releasefocus => 1,
+			);
+		
+$displaywin = $cui->add('dispwindow', 'Window',
+			-releasefocus => 1,
+			-y => 5, 
+			-x => 4,
+			-width      => 70, 
+			-height     => 15);
+
+$statwin = $cui->add('right_status', 'Window',
+			-title => 'Link',
+			-height => 5,
+			-width => 8,
+			-y => 1,
+			-x => 1,
+			-bfg => 'green'
+			);
+
+$statwin_title = $statwin->add(
+			'statwin_title', 'Label',
+			-border => 1,
+			-fg => 'yellow',
+			-text => 'Link',
+			-bold => 1,
+			-x => 1,
+			);
+
+$carpwin = $cui->add('left_status', 'Window',
+			-title => 'CARP',
+			-height => 5,
+			-width => 8,
+			-y => 1,
+			-x => 9,
+			-bfg => 'green'
+			);
+
+$carpwin_title = $carpwin->add(
+			'carpwin_title', 'Label',
+			-border => 1,
+			-fg => 'yellow',
+			-text => 'CARP',
+			-bold => 1,
+			-x => 1,
+			);
+
+
+$cui->set_binding( \&quit, "\cq");
+$cui->set_binding( \&show_build, "\cb");
+$cui->set_binding(sub { shift()->root->focus('menu') }, "\cx");
+
+sub quit {
+	exit 0;
+}
+
+sub delourwins {
+	$monittype = undef;
+	$displaywin->delete('display');
+	$cui->delete('def');
+	$cui->reset_curses;
+}
+
+sub printvals {
+	delourwins();
+	$cui->status(
+	-title => 'SpamCheetah configured successfully',
+	-fg => 'green',
+	-bold => 1,
+	-message => "Now SpamCheetah can be accessed at http://$ipaddrtext/ with \nusername admin and password foo1729");
+	sleep(4);
+	$cui->nostatus;
+}
+
+sub printerr{
+	($errstring) = @_;
+	delourwins();
+	$cui->status(
+          -bold => 1,
+	  -fg  => 'red',
+	  -message => $errstring,
+	   -buttons => ['ok'],
+	   -title => "Error");
+	sleep(4);
+	$cui->nostatus;
+}
+
+sub printsuccess{
+	($string) = @_;
+	delourwins();
+	$cui->status(
+          -bold => 1,
+	  -fg  => 'green',
+	  -message => $string,
+	   -buttons => ['ok'],
+	   -title => "Success");
+	sleep(4);
+	$cui->nostatus;
+
+}
+
+###################################################
+# FIFO stuff for broker
+###################################################
+
+
+sub initclient {
+	$socketfile = "/tmp/unixsock";
+	$client = IO::Socket::UNIX->new(Peer  => $socketfile,
+			Type      => SOCK_STREAM ) or die $!;
+}
+	
+sub sendcmd {
+	&initclient;
+	my @data = @_;
+	my $trailer = ".\n";
+	push @data, $trailer;
+	print $client @data;
+	$client->flush;
+	close($client);
+}
+
+sub sendcmdresponse {
+	&initclient;
+	my @data = @_;
+	my $trailer = ".\n";
+	push @data, $trailer;
+	print $client @data;
+	$client->flush;
+	@lines = ();
+	while($data= <$client>) {
+		push @lines, $data;
+	}
+	return @lines;
+	close($client);
+}
+
+###################################################
+# Now for privileged  code
+###################################################
+
+sub install_spamcheetah {
+	ualarm(0);
+	$cui->leave_curses;
+	exec ("/usr/local/sbin/installtodisk");
+}
+
+sub finishcfg {
+	@args = ();
+	push @args, $intf_value;
+	chomp($ipaddrtext = $ipaddr->get());
+	push @args, $ipaddrtext;
+	chomp($masktext = $mask->get());
+	push @args, $masktext;
+	chomp($gatewaytext = $gateway->get());
+	push @args, $gatewaytext;
+
+	$cmd = "SAVENWCONFIG";
+	$line = join "\n", @args;
+	($err, $errstring) = sendcmdresponse($cmd . "\n" . $line);
+	chomp($err);
+
+	if($err !~ /SUCCESS/) {
+		&printerr($errstring);
+	} else {
+		&printvals;
+	}
+
+}
+
+sub config_intf()
+{
+	delourwins();
+	if($oneif eq 0) {
+		$intf_value = $intfradio->get();
+		chomp($intf_value);
+	}
+	($intf_value) = split / /, $intf_value;
+
+	$msgtype = "SAVE_IF";
+	
+	sendcmd($msgtype . "\n" . $intf_value);
+	$SIG{ALRM} = \&updateall;
+	&updateall;
+
+	if(-e ".refresh") {
+		$intvl = `cat .refresh`;
+	} else {
+		$intvl = 120;
+	}
+	$updateint = $intvl * 1000000;
+	ualarm($updateint, $updateint);
+	&show_splash_screen;
+}
+
+sub reb {
+	ualarm(0);
+	$msgtype = "REBOOT";
+	sendcmd($msgtype);
+}
+
+sub shut {
+	ualarm(0);
+	$msgtype = "SHUTDOWN";
+	sendcmd($msgtype);
+}
+
+sub getconfig {
+	&getipandmask;
+	&masktoprintable;
+	$gatewayval =`netstat -nr -f inet|grep default|tr -s ' '|cut -d' ' -f2 | tr -d ' '`;
+	chomp($gatewayval);
+	$gatewayval =~ s/\s+//;
+}
+
+###################################################
+# GUI code
+###################################################
+$greycnt = 0;
+sub show_greylist_slow {
+	$greycnt++;
+	if($greycnt == 5) {
+		$greycnt = 0;
+		&show_greylist;
+	}else {
+		return;
+	}
+}
+sub updatemonit {
+	if($monittype eq undef) {
+		return;
+	} elsif($monittype =~ /show_details_grey/) {
+		&show_greylist_slow;
+	} elsif($monittype =~ /show_mail_attempts/) {
+		&show_mail_attempts;
+	} elsif($monittype =~ /show_pftop_grey/) {
+		&show_live_greylist;
+	} elsif($monittype =~ /show_pftop_mail/) {
+		&show_live_mail;
+	} elsif($monittype =~ /bwm_ng/) {
+		&show_total_bandwidth;
+	} elsif($monittype =~ /show_pktstat/) {
+		&show_ip_bandwidth;
+	} elsif($monittype =~ /show_memory_cpu/) {
+		&show_memory_cpu;
+	} elsif($monittype =~ /show_raw_packet/) {
+		&show_raw_packet;
+	} elsif($monittype =~ /show_network_stats/) {
+		&show_network_stats;
+	}
+}
+
+sub checkcarpstate {
+	$st = `ifconfig carp0 | grep status | cut -d: -f2`;
+ 
+	chomp($st);
+	if($st =~ /master/) {
+		$carp_status = "green";
+	} else {
+		$carp_status = "blue";
+	}
+	if($carp_status =~ /green/) {
+		$carp_txt = ' MASTER';
+	} else {
+		$carp_txt = ' SLAVE';
+	}
+
+}
+
+sub checklink {
+	$st = `ifconfig $intf_value | grep status | cut -d: -f2`;
+ 
+	if($st =~ /active/) {
+		$link_status = "green";
+	} else {
+		$link_status = "red";
+	}
+	if($link_status =~ /green/) {
+		$up_down_txt = ' UP ';
+	} else {
+		$up_down_txt = ' DOWN ';
+	}
+}
+
+sub updateall {
+	&drawcarpstatus;
+	&drawlinkstatus;
+	&updatemonit;
+}
+
+sub getipandmask {
+
+	$ipline=`ifconfig $intf_value | grep -v inet6 | grep inet`;
+
+	if ( $ipline =~  /inet/ ) {
+		($dummy, $spamcheetahip, $dummy, $mask) = split / /, $ipline;
+	} else {
+		$spamcheetahip = undef;
+		$mask    = undef;
+	}
+	return;
+}
+
+sub masktoprintable {
+        $first = substr $mask, 2,2; 
+        $second = substr $mask, 4,2; 
+        $third = substr $mask,6,2;
+        $fourth = substr $mask,8,2;
+
+        $b1 = hex $first;
+        $b2 = hex $second;
+        $b3 = hex $third;
+        $b4 = hex $fourth;
+        if($b1 eq 0) { 
+                $mask=undef;
+        } else {
+                $mask="$b1.$b2.$b3.$b4";
+        }     
+}
+
+sub config_spamcheetah {
+	delourwins();
+
+	if(!defined($intf_value)) {
+		&choose_intf;
+	}
+
+	&getconfig;
+	$instwin = $cui->add('def', 'Window',
+				-title => 'Enter IP addresses; select APPLY and press ENTER',
+				-border => 1,
+				-width => 68,
+				-height => 10,
+				-x => 5,
+				-y => 7,
+				);
+
+	$ipaddr_label = $instwin->add('ipaddr_label' , "Label",
+			-bg => 'black',
+			-fg => 'red',
+			-y => 1,
+			-x => 3,
+			-bold => 1,
+			-textalignment => 'left',
+			-text => "IP");
+
+	$ipaddr = $instwin->add('ipaddress' , "TextEntry",
+			-sbborder => 1,
+			-y => 1,
+			-x => 10,
+			-width => 18,
+			-text => "$spamcheetahip"
+			);
+
+	$mask_label = $instwin->add('mask_label' , "Label",
+			-bg => 'black',
+			-fg => 'red',
+			-y => 2,
+			-x => 3,
+			-bold => 1,
+			-textalignment => 'right',
+			-text => "Mask");
+
+	$mask = $instwin->add('mask' , "TextEntry",
+			-sbborder => 1,
+			-y => 2,
+			-x => 10,
+			-width => 18,
+			-text => "$mask"
+			);
+
+	$gateway_label = $instwin->add('gateway_label' , "Label",
+			-bg => 'black',
+			-fg => 'red',
+			-y => 3,
+			-x => 3,
+			-bold => 1,
+			-textalignment => 'left',
+			-text => "GWY");
+
+	$gateway = $instwin->add('gateway' , "TextEntry",
+			-sbborder => 1,
+			-y => 3,
+			-x => 10,
+			-width => 18,
+			-text => "$gatewayval"
+			);
+
+	$scconfbutton = $instwin->add(
+			undef => "Buttonbox",
+			-bg => 'yellow',
+			-fg => 'black',
+			-y => 6,
+			-x => 27,
+			-buttons => [ 
+			{ 
+			-label => '[APPLY]',
+			-value => 1,
+			-onpress => \&finishcfg,
+			},
+			] );
+
+	$ipaddr->focus();
+
+}
+
+sub choose_intf {
+	delourwins();
+
+	@devs = `ifconfig | grep lladdr -B 1 |egrep -v 'lladdr|-|carp|lo'  | cut -d: -f1`;
+	chomp(@devs);
+	if( $#devs eq 0) {
+		$intf_value = $devs[0];
+
+		$cui->status(
+				-title => 'SpamCheetah configured successfully',
+				-fg => 'green',
+				-y => -3,
+				-message => "You have only one network interface"
+			    );
+		sleep(4);
+		$cui->nostatus;
+		$oneif = 1;
+		&config_intf;
+
+	} else {
+
+		@radio = ();
+		chomp(@devs);
+		for(@devs) {
+			chomp();
+			$st = `ifconfig $_ | grep status | cut -d: -f2`;
+			if($st =~ /active/) {
+				push @radio, $_ . " UP";		
+				$intf_value = $_;
+			} else {
+				push @radio, $_ . " DOWN";		
+			}
+
+		}
+		 if(grep(/UP/, @radio) eq 1) { 
+
+                        $cui->status(
+                                        -title => 'SpamCheetah configured successfully',
+                                        -fg => 'green',
+                                        -y => -3,
+                                        -message => "Chose interface $intf_value as it is up"
+                                    );
+                        sleep(4);
+                        $cui->nostatus;
+                        $oneif = 1; 
+                        return &config_intf;
+                }
+
+
+		$values = \@radio;
+
+		$intfwin = $cui->add('def', 'Window',
+				-releasefocus => 1,
+				-title => 'Configure N/W interface',
+				-border => 1,
+				-width => 45,
+				-height => 15,
+				-x => 17,
+				-y => 4
+				);
+
+
+		$intfradio = $intfwin->add(
+				'intfradio', 'Radiobuttonbox',
+				-x          => 7,
+				-y          => 1,
+				-ipadright  => 4,
+				-ipadleft  => 4,
+				-ipadtop  => 2,
+				-bg => 'yellow',
+				-values     => $values,
+				-width      => 30,
+				-height	    => 8,
+				-title      => 'Choose interface'
+				);
+	$confbutton = $intfwin->add(
+			'mybutton' => "Buttonbox",
+			-y => -3,
+			-x => 10,
+			-label => 'Select interface',
+			-bg => 'white',
+			-fg => 'red',
+			-sbborder => 1,
+			-width => 18,
+			-buttons => [ 
+			{ 
+			-label => 'Select interface',
+			-value => 1,
+			-onpress => \&config_intf,
+			},
+			] );
+
+	$intfradio->focus();
+	}
+
+}
+
+sub drawcarpstatus {
+	&checkcarpstate;
+
+	$carpwin->delete('tmp');
+	$carp_stat_label = $carpwin->add(
+			'tmp', 'Label',
+			-y => 3,
+			-x => 1,
+			-bg => $carp_status,
+			-text => $carp_txt
+			);
+	$carpwin->draw();
+	$carp_stat_label->draw();
+
+}
+sub drawlinkstatus {
+	&checklink;
+
+	$statwin->delete('tmp2');
+	$link_status_label = $statwin->add(
+			'tmp2', 'Label',
+			-y => 3,
+			-x =>1,
+			-bg => $link_status,
+			-text => $up_down_txt
+			);
+
+	$statwin->draw();
+	$link_status_label->draw();
+
+}
+
+sub show_line {
+	($ourline) = $wl->get_active_value();
+	($ip) = split / /, $ourline;
+	chomp($ip);
+	($line) = grep(/$ip/, @o);
+	($d, $last) = split / /, $line;
+	chomp($last);
+	$t = "From: " . $last;
+	$greywin->delete('g');
+	$label = $greywin->add('g', 'Label',
+				-y => -3,
+				-x => 7,
+				-fg => 'green',
+				-width => 70,
+				-height => 1,
+				-textalignment => 'left',
+				-bold => 1,
+				-text => $t);
+	$label->draw();
+	$wl_but->draw();
+}
+
+sub no_upgrade {
+	printerr("Upgrade not done");
+}
+
+sub upgrade_reb {
+	my $cmd = 'UPGRADE_REB';
+	sendcmd($cmd);
+
+}
+
+sub upgrade_patches_do {
+	delourwins();
+	$upgrade_fetch = "ftp -V -o /tmp/grey-latest.tgz http://www.spam-cheetah.com/upgrade/grey-latest.tgz";
+	system($upgrade_fetch);
+
+	`/bin/tar -C /tmp -zxpf /tmp/grey-latest.tgz version.txt`;
+	$upgrade_version = `cat /tmp/version.txt`;
+	chomp($upgrade_version);
+
+	$ans = $cui->root->dialog(
+		-title => 'Upgrade to Latest and Reboot?',
+		-fg => 'red',
+		-bold => 1,
+			-message => "Upgrade to [$upgrade_version] and reboot?",
+			-buttons =>
+				[
+				{
+					-label => '[ YES ]',
+				},
+				{
+					-label => '[ NO ]',
+				}
+				]);
+	if($ans eq 0) {
+		&upgrade_reb;
+	} else {
+		&no_upgrade;
+	}
+
+
+}
+
+sub set_refresh_do {
+	delourwins();
+	$intvl = $refreshrate->get();
+	chomp($intvl);
+
+	unless($intvl >= 30 and $intvl <= 120) {
+		return &printerr("Please enter a value greater than 30 and less than 120");
+	} else {
+		$updateint = $intvl * 1000000;
+		ualarm(0);
+		$SIG{ALRM} = \&updateall;
+		ualarm($updateint, $updateint);
+		open REF, ">.refresh";
+		print REF $intvl;
+		close REF;
+		&showheading;
+		&printsuccess("Refresh set to $intvl seconds");
+	}
+
+	&showheading;
+
+}
+
+sub set_refresh {
+	delourwins();
+		
+	
+	$whitewin = $cui->add('def', 'Window',
+				-title => 'Screen refresh rate: 30 - 120 secs',
+				-border =>1,
+				-width => 40,
+				-height => 8,
+				-x => 18,
+				-y => 5
+			);
+
+	$whitewin->add(undef, 'Label',
+				-y => 2,
+				-x => 2,
+				-sbboder => 1,
+				-fg => 'yellow',
+				-bold => 1,
+				-text => 'Refresh rate in seconds '
+				);
+
+
+	if(-e ".refresh") {
+		$intvl = `cat .refresh`;
+	}
+	$refreshrate = $whitewin->add(undef, 'TextEntry',
+				-sbborder => 1,
+				-y => 2,
+				-x => 28,
+				-bold => 1,
+				-width => 8,
+				-text => $intvl
+				);
+
+	$whitewin->add(undef, 'Buttonbox',
+				-y => 5,
+				-x => 14,
+				-bg => 'yellow',
+				-fg => 'black',
+				-buttons =>
+				[
+				{
+					-label => '[ Save ]',
+					-shortcut => 's',
+					-onpress => \&set_refresh_do
+				}
+				]);
+	$refreshrate->focus();
+	$whitewin->draw();
+}
+
+sub show_total_bandwidth {
+	$monittype = "bwm_ng";
+	@lines = ();
+	@lines = `/usr/local/bin/bwm-ng -c 1 -o plain`;
+	$line = join "\n", @lines;
+			
+		
+	$cui->delete('def');
+	$displaywin->delete('display');
+	my $bwm_display = $displaywin->add(
+			'display', 'Label',
+			-title => 'Aggregate bandwidth usage',
+			-y => 1, 
+			-x => 1,
+			-fg => 'white',
+			-bold => 1,
+			-bfg => 'yellow',
+			-border => 1,
+			-ipadleft => 6,
+			-ipadright => 6,
+			-width      => 70, 
+			-height     => 15,
+			-border     => 1,
+			-text => $line
+			);
+
+	$displaywin->draw();
+	$bwm_display->draw();
+
+}
+
+sub show_ip_bandwidth {
+	$monittype = "show_pktstat";
+	$cmd = 'SHOW_PKTSTAT';
+	@lines = ();
+	@lines = sendcmdresponse($cmd);
+
+	$line = join "\n", @lines;
+			
+		
+	$cui->delete('def');
+	$displaywin->delete('display');
+	my $pktstat_display = $displaywin->add(
+			'display', 'Label',
+			-title => 'IP wise split of bandwidth usage',
+			-y => 1, 
+			-x => 1,
+			-fg => 'white',
+			-bold => 1,
+			-bfg => 'yellow',
+			-border => 1,
+			-ipadleft => 6,
+			-ipadright => 6,
+			-width      => 70, 
+			-height     => 15,
+			-border     => 1,
+			-text => $line
+			);
+
+	$displaywin->draw();
+	$pktstat_display->draw();
+
+
+}
+
+sub show_memory_cpu {
+	$monittype = "show_memory_cpu";
+
+	@lines = ();
+	@lines = `top -b | grep -v PID`;
+	$line = join "\n", @lines;
+
+	$cui->delete('def');
+	$displaywin->delete('display');
+	my $top_display = $displaywin->add(
+			'display', 'Label',
+			-title => 'CPU and Memory Usage',
+			-y => 1, 
+			-x => 1,
+			-fg => 'white',
+			-bold => 1,
+			-bfg => 'yellow',
+			-border => 1,
+			-ipadleft => 6,
+			-ipadright => 6,
+			-width      => 70, 
+			-height     => 15,
+			-border     => 1,
+			-text => $line
+			);
+
+
+	$displaywin->draw();
+	$top_display->draw();
+
+
+}
+
+sub show_raw_packet {
+	$monittype = "show_raw_packet";
+	$cmd = 'SHOW_RAW_PKT';
+	@lines = ();
+	@lines = sendcmdresponse($cmd);
+
+	$line = join "\n", @lines;
+			
+	
+	$cui->delete('def');
+	$displaywin->delete('display');
+	my $tcpdump_display = $displaywin->add(
+			'display', 'Label',
+			-title => 'Raw packets on the wire',
+			-y => 1, 
+			-x => 1,
+			-fg => 'white',
+			-bold => 1,
+			-bfg => 'yellow',
+			-border => 1,
+			-ipadleft => 6,
+			-ipadright => 6,
+			-width      => 70, 
+			-height     => 15,
+			-border     => 1,
+			-text => $line
+			);
+
+
+	$displaywin->draw();
+	$tcpdump_display->draw();
+}
+
+sub show_network_stats {
+	$monittype = "show_network_stats";
+	$cmd = 'SHOW_PKTSTAT';
+
+	@lines = ();
+	@lines = `netstat -p tcp -n`;
+	$line = join "\n", @lines;
+	
+	
+	$cui->delete('def');
+	$displaywin->delete('display');
+	my $netstat_display = $displaywin->add(
+			'display', 'Label',
+			-title => 'Show TCP connection states',
+			-y => 1, 
+			-x => 1,
+			-fg => 'white',
+			-bold => 1,
+			-bfg => 'yellow',
+			-border => 1,
+			-ipadleft => 6,
+			-ipadright => 6,
+			-width      => 70, 
+			-height     => 15,
+			-border     => 1,
+			-text => $line
+			);
+
+
+	$displaywin->draw();
+	$netstat_display->draw();
+
+
+}
+
+###################################################
+#  Init section
+###################################################
+sub subr {
+	$cui->dialog(-title => 'Girish is great',
+			-x => 20,
+			-y => 10,
+			-message => 'But God is still greater'
+		    );
+}
+
+sub display_help {
+	delourwins();
+
+
+           my $notebook = $win->add(undef, 'Notebook',
+			-padtop => 3,
+			-padbottom => 4,
+			-padleft => 3,
+			-padright => 3,
+			-fg => 'yellow',
+		);
+           my $page1 = $notebook->add_page('Keyboard shortcuts');
+
+	@keyboard_shortcuts = qq(
+		        Quick shortcuts
+		  	----------------- 
+			Ctrl-X : Invoke Menu
+			ESC    : Quit menu item
+			Ctrl-A : Go to beginning
+			Ctrl-K : Delete Line
+			Ctrl-D : Delete Char
+			TAB    : Go to next item
+			->     : Go to next menu 
+			<-     : Go to previous menu 
+			DOWN   : To to next choice/text entry
+			UP     : To to next choice/text entry
+			SPACE: Select_item    
+			Ctrl-Z : Undo edit
+
+		);
+
+	$kb_line = join "\n", @keyboard_shortcuts;
+		
+	$help1 = $page1->add(
+			undef, 'TextViewer',
+			-title => 'Command Reference ',
+               		-x    => 1,
+               		-y    => 1,
+			-text    => $kb_line
+			);
+
+
+           my $page2 = $notebook->add_page('Menu items');
+	@menu_lines = qq(
+			Main
+			Spam Control
+			Monitoring
+			Help
+			Quit
+
+		);
+
+	$menu_item_desc = join "\n", @menu_lines;
+
+
+$page2->add(
+               undef, 'TextViewer',
+               -x    => 1,
+               -y    => 1,
+               -text => $menu_item_desc
+           );
+
+
+           #my $page3 = $notebook->add_page('Advanced', -on_activate => \&subr );
+
+           my $page3 = $notebook->add_page('Advanced');
+	@adv_lines = qq(
+			Theory of SpamCheetah
+		SpamCheetah is a top class spam control 
+		technique that aims to strike at the root 
+ 		of the problem viz., the network entry point.
+
+		);
+
+	$advanced_topics = join "\n", @adv_lines;
+
+           $page3->add(
+               undef, 'TextViewer',
+		-title => 'Advanced topics',
+               -x    => 1,
+               -y    => 1,
+               -text => $advanced_topics
+           );
+
+           $notebook->focus;
+
+
+}
+
+sub display_ver {
+	delourwins();
+
+	@lines = "SpamCheetah 1.5";
+
+	$line = join "\n", @lines;
+		
+	$live_mail = $win->add(
+			undef, 'TextViewer',
+			-title => 'SpamCheetah Version',
+			-y => 6, 
+			-x => 4,
+			-fg => 'white',
+			-bfg => 'yellow',
+			-border => 1,
+			-ipadleft => 6,
+			-ipadright => 6,
+			-showlines => 1,
+			-width      => 70, 
+			-height     => 15,
+			-border     => 1,
+			-vscrollbar => 1,
+			-wrapping   => 1,
+			-text    => $line
+			);
+			
+	$live_mail->focus;
+
+}
+
+sub wrap_show_total_bandwidth {
+	&show_total_bandwidth;
+	$cui->reset_curses;
+}
+sub wrap_show_ip_bandwidth {
+	&show_ip_bandwidth;
+	$cui->reset_curses;
+}
+sub wrap_show_memory_cpu {
+	&show_memory_cpu;
+	$cui->reset_curses;
+}
+sub wrap_show_raw_packet { 
+	&show_raw_packet;
+	$cui->reset_curses;
+}
+sub wrap_show_network_stats {
+	&show_network_stats;
+	$cui->reset_curses;
+}
+
+
+###################################################
+#  Menus
+###################################################
+
+	$f = `mount | egrep -c 'wd|sd' `;
+	chomp($f);
+	if($f eq 0) {
+		@floatingmenus = ({ -label => 'Install SpamCheetah to disk',
+		  -value => \&install_spamcheetah
+		},
+		{ -label => 'Configure IP addresses',
+		  -value => \&config_spamcheetah
+		});
+	} else {
+		@floatingmenus = ({ -label => 'Configure IP addresses',
+		  -value => \&config_spamcheetah
+		});
+
+
+	}
+
+	$netconfigmenu = [
+		{ -label => 'Choose Network Interface',
+		  -value => \&choose_intf,
+		},
+		 @floatingmenus, 
+		{
+		-label => 'Set screen refresh interval',
+		-value => \&set_refresh
+		}, 
+		{
+		-label => 'Show Splash screen',
+		-value => \&show_splash_screen
+		}
+		];
+	
+
+	$monitmenu = [
+		{ -label => 'Show Total bandwidth usage',
+		  -value => \&wrap_show_total_bandwidth
+		},
+		{ -label => 'Show memory and CPU usage',
+		  -value => \&wrap_show_memory_cpu
+		},
+		{ -label => 'Show raw packet data',
+		  -value => \&wrap_show_raw_packet
+		},
+		{ -label => 'Show Network statistics',
+		  -value => \&wrap_show_network_stats
+		},
+		];
+
+
+	$shutmenus = [
+		{ -label => 'Shutdown ',
+		  -value => \&shut
+		}, 
+		{ -label => 'Reboot ',
+		  -value => \&reb
+		} 
+		];
+	$topmenu = [
+		{
+			-label => 'Start' , -submenu => $netconfigmenu,
+		},
+		{
+			-label => 'Monitoring' , -submenu => $monitmenu,
+		},
+		{
+			-label => 'Quit', -submenu => $shutmenus,
+		}
+		];
+
+$menu = $cui->add('menu', "Menubar",
+		  -fg => 'red',
+		  -menu => $topmenu);
+
+
+$helplabel = $win->add('help', 'TextViewer',
+			-y => -1,
+			-x => 1,
+			-width => 85,
+			-height => 4,
+			-border => 1,
+			-bold => 1,
+			-fg => 'white',
+			-textalignment => 'middle',
+			-text => "   Ctrl-X: Open_menu     -->: Next_menu       <--: Prev_Menu Ctrl-Z: Undo\n SPACEBAR: Select_item   TAB: Next_item    Ctrl-K: DEL_LINE  Ctrl-D: DEL_CHR");
+sub showheading {
+	$win->delete('heading');
+	$f = `mount | egrep -c 'wd|sd' `;
+	chomp($f);
+	if($f eq 0) {
+		$tail = " LiveCD edition";
+	} else {
+		$tail = " Hard disk edition";
+	}
+	$edition_text = "SpamCheetah " . $tail;
+	$heading = $win->add('heading', 'Label',
+			-y => 2,
+			-x => 1,
+			-width => 85,
+			-height => 2,
+			-bold => 1,
+			-fg => 'red',
+			-textalignment => 'middle',
+			-text => $edition_text
+			);
+	$heading->draw;
+	$startup = $displaywin->add(
+			'display', 'Label',
+			-title => 'SpamCheetah console',
+			-y => 1, 
+			-x => 1,
+			-fg => 'yellow',
+			-bold => 1,
+			-bfg => 'yellow',
+			-textalignment => 'middle',
+			-border => 1,
+			-ipadleft => 6,
+			-ipadright => 6,
+			-width      => 70, 
+			-height     => 15,
+			-border     => 1,
+			-text => $splash_line
+			);
+
+
+	$startup->draw();
+	$startup->focus();
+	$displaywin->draw();
+}
+
+sub show_splash_screen {
+	delourwins();
+	&getconfig;
+	@cd_splash_screen = 
+
+
+qq(Please follow the sequence given below:
+
+	1\) Install SpamCheetah to disk
+	2\) Reboot from hard disk
+	3\) Choose network interface
+	6\) Configure IP addresses
+	7\) Continue from web interface);
+
+if($spamcheetahip =~ /\d/) {
+	@harddisk_splash_screen = 
+qq(
+
+SpamCheetah can be accessed at 
+
+http://$spamcheetahip/ 
+        user: admin 
+        password: foo1729
+);
+} else {
+
+	@harddisk_splash_screen = 
+qq(Please follow the sequence given below:
+
+	1\) Choose network interface
+	2\) Configure IP addresses
+	3\) Continue from web interface);
+
+
+}
+
+	$f = `mount | egrep -c 'wd|sd' `;
+	chomp($f);
+	if($f eq 0) {
+		$splash_line = join "\n", @cd_splash_screen;
+	} else {
+		$splash_line = join "\n", @harddisk_splash_screen;
+	}
+	&showheading;
+
+}
+&choose_intf;
+$monittype = undef;
+$cui->mainloop;
